@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="es-CL">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clínica del PC — INACAP San Pedro de la Paz</title>
+  <link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+  <header class="top-header">
+    <div class="header-inner">
+      <div class="brand-block">
+        <div class="inacap-mark" aria-hidden="true">INACAP</div>
+        <div class="brand-titles">
+          <h1>Clínica del PC</h1>
+          <p>Sede San Pedro de la Paz · Atención y Soporte Técnico</p>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <div class="header-picker" id="ticket-picker-wrap" style="display: none;">
+          <label for="select-active-ticket" class="sr-only">Ficha activa</label>
+          <select id="select-active-ticket" class="ticket-select" title="Cambiar ficha activa"></select>
+        </div>
+
+        <span class="status-pill" id="hdr-db-badge" title="Estado de conexión con PostgreSQL 17">
+          <span class="dot"></span>
+          <span class="status-text">Verificando base de datos</span>
+        </span>
+
+        <span class="user-pill" id="user-session-chip" style="display: none;"></span>
+
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-open-scenarios" title="Accesos rápidos para revisión de casos">
+          Casos de prueba
+        </button>
+        <button type="button" class="btn btn-outline btn-sm" id="btn-open-auth">
+          Iniciar sesión
+        </button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-logout" style="display: none;">
+          Salir
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div class="app-shell is-public" id="app-shell">
+    <nav class="side-nav" id="side-navigation" aria-label="Menú operativo"></nav>
+    <main class="main-view" id="main-content"></main>
+  </div>
+
+  <footer class="app-footer">
+    <span>Clínica del PC · Área de Informática y Telecomunicaciones · INACAP Sede San Pedro de la Paz</span>
+    <span>Daniel Melimán &amp; Diego Astudillo</span>
+  </footer>
+
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+  <div class="modal-backdrop" id="app-modal">
+    <div class="modal-box" id="app-modal-content"></div>
+  </div>
+
+  <script src="/js/validators.js" defer></script>
+  <script src="/js/api.js" defer></script>
+  <script src="/js/app.js" defer></script>
+</body>
+</html>

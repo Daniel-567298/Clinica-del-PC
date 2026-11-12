@@ -1,0 +1,23 @@
+# Secretos y variables de entorno (OWASP A04)
+.env
+*.env
+**/.env
+!.env.example
+
+# Python / Django
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+staticfiles/
+media/
+*.log
+db.sqlite3
+
+# SO e IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

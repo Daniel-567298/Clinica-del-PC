@@ -21,3 +21,11 @@ db.sqlite3
 Thumbs.db
 .vscode/
 .idea/
+
+# Datos y artefactos exclusivos de instalaciones locales
+backups/
+pgdata/
+postgres/
+*.dump
+*.pid
+evidencias/

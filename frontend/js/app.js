@@ -2894,4 +2894,3 @@
     await refreshSession(false);
   });
 })();
-

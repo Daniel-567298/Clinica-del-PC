@@ -28,6 +28,8 @@ from clinica.models import (
     EncuestaSatisfaccion,
     EventoSeguridadOWASP,
     FichaAtencion,
+    EventoClinica,
+    Sede,
     PerfilOperador,
     PlantillaTarea,
     Propietario,
@@ -54,6 +56,10 @@ from clinica.security.validators import (
     validar_rut_chileno,
 )
 from clinica.serializers import (
+    EventoSerializer,
+    SedeSerializer,
+    EntregaInputSerializer,
+    EncuestaInputSerializer,
     EventoSeguridadSerializer,
     FichaDetailSerializer,
     FichaSummarySerializer,
@@ -62,6 +68,7 @@ from clinica.serializers import (
     ServicioPlantillaSerializer,
     TriajeOwnerSerializer,
 )
+from clinica.security.eventos import sedes_permitidas, eventos_permitidos, evento_seleccionado, fichas_permitidas
 
 
 def _client_ip(request) -> str | None:
@@ -111,6 +118,7 @@ class AuthMeView(APIView):
                 "email": request.user.email,
                 "rol": get_user_role(request.user),
                 "seccion": perfil.seccion if perfil else "TI3043-01",
+                "sedes": list(sedes_permitidas(request.user).values("id", "nombre")),
             }
         )
 
@@ -199,9 +207,11 @@ class AuthLoginView(APIView):
 
 
 class AuthLogoutView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
+        if not request.user.is_authenticated:
+            return Response({"authenticated": False})
         actor = _actor_label(request.user)
         ClinicEventBus.get_instance().publish(
             "LOGOUT",
@@ -244,14 +254,106 @@ class AuthUnlockDemoView(APIView):
 # ==============================================================================
 # PASO 1: PREINSCRIPCIÓN PÚBLICA QR (SIN CUENTA DE USUARIO)
 # ==============================================================================
+class SedesView(APIView):
+    def get_permissions(self):
+        return [AllowAny()] if self.request.method == "GET" else [IsDocentePO()]
+
+    def get(self, request):
+        qs = sedes_permitidas(request.user) if request.user.is_authenticated else Sede.objects.filter(activa=True)
+        return Response(SedeSerializer(qs, many=True).data)
+
+    @transaction.atomic
+    def post(self, request):
+        ser = SedeSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        sede = ser.save()
+        perfil, _ = PerfilOperador.objects.get_or_create(user=request.user, defaults={"rol": ROLE_DOCENTE_PO})
+        perfil.sedes.add(sede)
+        return Response(SedeSerializer(sede).data, status=201)
+
+
+class OperadoresSedeView(APIView):
+    permission_classes = [IsDocentePO]
+
+    def get(self, request):
+        managed = sedes_permitidas(request.user)
+        users = PerfilOperador.objects.select_related("user").filter(sedes__in=managed).distinct()
+        return Response([{"id": p.user_id, "nombre": p.user.get_full_name() or p.user.username,
+                          "rol": p.rol, "sedes": list(p.sedes.values_list("id", flat=True))} for p in users])
+
+    def post(self, request):
+        from rest_framework.exceptions import ValidationError
+        try:
+            sede = sedes_permitidas(request.user).get(pk=int(request.data.get("sede")))
+            perfil = PerfilOperador.objects.filter(sedes__in=sedes_permitidas(request.user)).distinct().get(user_id=int(request.data.get("usuario")))
+        except (ValueError, TypeError, Sede.DoesNotExist, PerfilOperador.DoesNotExist):
+            raise ValidationError("Sede u operador no disponible para tu perfil.")
+        perfil.sedes.add(sede)
+        return Response({"vinculado": True})
+
+
+class EventosView(APIView):
+    def get_permissions(self):
+        return [AllowAny()] if self.request.method == "GET" else [IsDocentePO()]
+
+    def get(self, request):
+        internal = request.user.is_authenticated
+        qs = eventos_permitidos(request.user) if internal else EventoClinica.objects.filter(
+            sede__activa=True, estado__in=["Inscripciones abiertas", "En curso"])
+        if not internal:
+            now=timezone.now()
+            qs=qs.filter(Q(inscripcion_desde__isnull=True)|Q(inscripcion_desde__lte=now)).filter(Q(inscripcion_hasta__isnull=True)|Q(inscripcion_hasta__gte=now))
+        return Response(EventoSerializer(qs.select_related("sede"), many=True, context={"internal": internal}).data)
+
+    def post(self, request):
+        ser = EventoSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        if not sedes_permitidas(request.user).filter(pk=ser.validated_data["sede"].pk).exists():
+            return Response({"detail": "No tienes permisos para esa sede."}, status=403)
+        event = ser.save(creado_por=request.user)
+        return Response(EventoSerializer(event, context={"internal": True}).data, status=201)
+
+
+class EstadoEventoView(APIView):
+    permission_classes = [IsDocentePO]
+
+    @transaction.atomic
+    def post(self, request, evento_id):
+        event = get_object_or_404(eventos_permitidos(request.user).select_for_update(), pk=evento_id)
+        target = request.data.get("estado")
+        transitions = {"Borrador": ["Inscripciones abiertas"], "Inscripciones abiertas": ["En curso", "Finalizado"],
+                       "En curso": ["Finalizado"], "Finalizado": ["En curso"]}
+        if target not in transitions[event.estado]:
+            return Response({"detail": "Cambio de estado de evento no permitido."}, status=400)
+        if target == "Finalizado" and event.fichas.exclude(estado__in=["Entregado conforme", "Devuelto sin reparación", "En custodia"]).exists():
+            return Response({"detail": "Resuelve las fichas pendientes o registra su custodia antes de finalizar la jornada."}, status=409)
+        if target == 'Finalizado' and event.jornadas.filter(estado='Abierta').exists():
+            return Response({'detail':'Cierra primero la jornada diaria abierta; finalizar el evento es una acción diferente.'},status=409)
+        if event.estado == "Finalizado" and not str(request.data.get("motivo", "")).strip():
+            return Response({"detail": "Indica el motivo para reabrir el evento."}, status=400)
+        previous = event.estado
+        event.estado = target
+        event.save(update_fields=["estado"])
+        if target == 'Finalizado':
+            event.jornadas.filter(estado='Pendiente').update(estado='No realizada')
+        ClinicEventBus.get_instance().publish("EVENT_STATE_CHANGE", {"usuario": request.user, "sede_id": event.sede_id,
+            "actor": _actor_label(request.user), "detalle": f"Evento {event.id}: {previous} -> {target}. {str(request.data.get('motivo', ''))[:200]}"})
+        return Response(EventoSerializer(event, context={"internal": True}).data)
+
+
 class PublicPreinscriptionView(APIView):
     permission_classes = [AllowAny]
 
     @transaction.atomic
     def post(self, request):
+        evento = evento_seleccionado(request, public=True)
         ser = QRPreinscriptionInputSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         d = ser.validated_data
+        preferred_id = d.get('jornada_preferida')
+        preferred = get_object_or_404(evento.jornadas.exclude(estado__in=['Cerrada','No realizada']),pk=preferred_id) if preferred_id else evento.jornadas.exclude(estado__in=['Cerrada','No realizada']).first()
+        if preferred is None:
+            return Response({'detail':'No quedan jornadas disponibles para recibir equipos en este evento.'},status=400)
 
         owner = ClinicaRepository.upsert_owner(
             rut=d["rut"],
@@ -261,12 +363,15 @@ class PublicPreinscriptionView(APIView):
             comuna_direccion=d["comuna_direccion"].strip(),
         )
         ficha = FichaAndChecklistFactory.create_qr_preinscription(
+            evento=evento,
             owner=owner,
             brand_model=d["marca_modelo"].strip(),
             device_type=d.get("tipo", "Notebook"),
             problem=d["problema_declarado"].strip(),
             service_names=d["servicios"],
         )
+        ficha.jornada_preferida = preferred
+        ficha.save(update_fields=['jornada_preferida'])
         ClinicEventBus.get_instance().publish(
             "QR_PREINSCRIPTION",
             {
@@ -275,11 +380,15 @@ class PublicPreinscriptionView(APIView):
                 "ruta": request.path,
                 "ip": _client_ip(request),
                 "detalle": f"Preinscripción QR generó ticket {ficha.numero_ticket} ({ficha.dispositivo.codigo_dispositivo}).",
+                "sede_id": evento.sede_id,
             },
         )
         return Response(
             {
                 "numero_ticket": ficha.numero_ticket,
+                "evento": evento.id,
+                "evento_nombre": evento.nombre,
+                "sede_nombre": evento.sede.nombre,
                 "estado": ficha.estado,
                 "titular": owner.nombre_completo,
                 "rut": owner.rut,
@@ -335,12 +444,14 @@ class TriajeSearchView(APIView):
 
     def get(self, request):
         q = request.query_params.get("q", "")
-        owners, latency = ClinicaRepository.search_triaje(q)
+        event = evento_seleccionado(request)
+        sedes = list(sedes_permitidas(request.user).values_list("id", flat=True))
+        owners, latency = ClinicaRepository.search_triaje(q, evento=event)
         return Response(
             {
                 "latencia_segundos": latency,
                 "cumple_rnf07": latency <= 2.0,
-                "propietarios": TriajeOwnerSerializer(owners, many=True).data,
+                "propietarios": TriajeOwnerSerializer(owners, many=True, context={"evento_id": event.id, "sedes": sedes}).data,
             }
         )
 
@@ -349,13 +460,15 @@ class NuevoTicketDispositivoView(APIView):
     permission_classes = [IsRecepcionOrDocente]
 
     def post(self, request, codigo_dispositivo: str):
+        event = evento_seleccionado(request)
         dev = get_object_or_404(
-            Dispositivo.objects.select_related("propietario"),
+            Dispositivo.objects.select_related("propietario").filter(fichas__evento__sede=event.sede).distinct(),
             codigo_dispositivo=codigo_dispositivo.upper(),
         )
         problema = str(request.data.get("problema_declarado", "Nueva atención en jornada actual.")).strip()
         servicios = request.data.get("servicios") or ["Mantención Física"]
         ficha = FichaAndChecklistFactory.create_qr_preinscription(
+            evento=event,
             owner=dev.propietario,
             brand_model=dev.marca_modelo,
             device_type=dev.tipo,
@@ -374,7 +487,7 @@ class FichaListView(APIView):
     permission_classes = [IsAnyInternalRole]
 
     def get(self, request):
-        fichas = ClinicaRepository.base_ficha_queryset().all()
+        fichas = fichas_permitidas(request, ClinicaRepository.base_ficha_queryset())
         return Response(FichaSummarySerializer(fichas, many=True, context={"request": request}).data)
 
 
@@ -382,7 +495,7 @@ class FichaDetailView(APIView):
     permission_classes = [IsAnyInternalRole]
 
     def get(self, request, numero_ticket: str):
-        ficha = get_object_or_404(ClinicaRepository.base_ficha_queryset(), numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request, ClinicaRepository.base_ficha_queryset()), numero_ticket=numero_ticket.upper())
         return Response(FichaDetailSerializer(ficha, context={"request": request}).data)
 
 
@@ -391,8 +504,11 @@ class RecepcionFichaView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(ClinicaRepository.base_ficha_queryset(), numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request, ClinicaRepository.base_ficha_queryset()), numero_ticket=numero_ticket.upper())
         data = request.data
+        day = ficha.evento.jornadas.filter(estado='Abierta').first()
+        if day is None:
+            return Response({'detail':'El docente debe abrir una jornada diaria antes de recibir equipos.'},status=400)
         services_names = data.get("servicios") or []
         if not services_names:
             return Response({"detail": "Seleccione al menos un servicio oficial (RF06)."}, status=400)
@@ -434,6 +550,8 @@ class RecepcionFichaView(APIView):
 
         now = timezone.now()
         ficha.consentimiento_firmado = True
+        if ficha.jornada_recepcion_id is None:
+            ficha.jornada_recepcion = day
         ficha.fecha_consentimiento = now
         ficha.firma_trazo_svg_data = str(data.get("firma_trazo_svg_data", "CANVAS_SIGNED"))[:8000]
         ficha.firma_hash_sha256 = compute_consent_sha256(
@@ -466,7 +584,7 @@ class TallerChecklistView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(ClinicaRepository.base_ficha_queryset(), numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request, ClinicaRepository.base_ficha_queryset()), numero_ticket=numero_ticket.upper())
         if ficha.hallazgo_ilicito_ley_21459:
             return Response(
                 {"detail": "Bloqueo Legal (Ley 21.459): intervención suspendida por hallazgo ilícito."},
@@ -513,7 +631,7 @@ class BitacoraNotaCreateView(APIView):
     permission_classes = [IsTecnicoOrDocente]
 
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(FichaAtencion, numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request), numero_ticket=numero_ticket.upper())
         contenido = str(request.data.get("contenido", "")).strip()
         if not contenido:
             return Response({"detail": "El texto de observación no puede estar vacío."}, status=400)
@@ -533,7 +651,7 @@ class VerificarFinalView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(ClinicaRepository.base_ficha_queryset(), numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request, ClinicaRepository.base_ficha_queryset()), numero_ticket=numero_ticket.upper())
         condicion = str(request.data.get("condicion_final", "")).strip()
         metricas = str(request.data.get("metricas_post_estres", "")).strip()
         comparacion = str(request.data.get("comparacion_final", "")).strip()
@@ -552,9 +670,10 @@ class VerificarFinalView(APIView):
         ficha.metricas_post_estres = metricas
         ficha.comparacion_final = comparacion
         ficha.verificado_salida = True
+        ficha.verificado_salida_en = timezone.now()
         ficha.correo_enviado = True
         ficha.save(
-            update_fields=["condicion_final", "metricas_post_estres", "comparacion_final", "verificado_salida", "correo_enviado"]
+            update_fields=["condicion_final", "metricas_post_estres", "comparacion_final", "verificado_salida", "verificado_salida_en", "correo_enviado"]
         )
         ficha = ClinicaRepository.base_ficha_queryset().get(pk=ficha.pk)
         return Response(FichaDetailSerializer(ficha, context={"request": request}).data)
@@ -565,7 +684,7 @@ class AvisoRetiroView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(FichaAtencion, numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request, allow_final=True), numero_ticket=numero_ticket.upper())
         tipo = request.data.get("tipo", "llamada")
         actor = _actor_label(request.user)
 
@@ -575,6 +694,7 @@ class AvisoRetiroView(APIView):
                 autor=request.user,
                 autor_nombre=actor,
                 contenido=f"Notificación WhatsApp registrada para contacto {ficha.propietario.telefono}.",
+                privada_meson=True,
             )
         else:
             estado_llamada = str(request.data.get("estado_llamada", "Contacto confirmado")).strip()
@@ -586,6 +706,7 @@ class AvisoRetiroView(APIView):
                 autor=request.user,
                 autor_nombre=actor,
                 contenido=f"CONTACTO RETIRO: {estado_llamada}. {obs}",
+                privada_meson=True,
             )
 
         ficha = ClinicaRepository.base_ficha_queryset().get(pk=ficha.pk)
@@ -597,15 +718,21 @@ class EntregaSalidaView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(ClinicaRepository.base_ficha_queryset(), numero_ticket=numero_ticket.upper())
-        data = request.data
-        tipo_receptor = data.get("tipo_receptor", "Titular")
-        resultado = data.get("resultado", "Entregado conforme")
+        ficha = get_object_or_404(
+            fichas_permitidas(request, FichaAtencion.objects.select_for_update(), allow_final=True), numero_ticket=numero_ticket.upper()
+        )
+        if ficha.resultado_entrega:
+            return Response({"detail": "La entrega ya fue registrada y su constancia no se puede sobrescribir."}, status=400)
+        ser = EntregaInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        tipo_receptor = data["tipo_receptor"]
+        resultado = data["resultado"]
 
         if tipo_receptor == "Tercero":
             t_nom = str(data.get("tercero_nombre", "")).strip()
             t_rut = str(data.get("tercero_rut", "")).strip()
-            t_auth = bool(data.get("tercero_autorizado_telefono", False))
+            t_auth = data["tercero_autorizado_telefono"]
             if not t_nom or not validar_rut_chileno(t_rut):
                 return Response({"detail": "Ingrese nombre y RUT válido (Módulo 11) del tercero receptor."}, status=400)
             if not t_auth:
@@ -627,8 +754,14 @@ class EntregaSalidaView(APIView):
             actor,
             request.user,
             note_text=f"ENTREGA REGISTRADA ({resultado}). Receptor: {ficha.tipo_receptor}{det}.",
+            note_private=True,
         )
         ficha.resultado_entrega = resultado
+        ficha.prueba_conjunta_resultado = data["prueba_conjunta_resultado"]
+        ficha.prueba_conjunta_observaciones = data["prueba_conjunta_observaciones"]
+        ficha.receptor_confirma_prueba = data["receptor_confirma_prueba"]
+        ficha.entrega_registrada_en = timezone.now()
+        ficha.entrega_registrada_por = request.user
         ficha.incidencia_activa = False
         ficha.save()
 
@@ -640,17 +773,18 @@ class EncuestaSatisfaccionView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(FichaAtencion, numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(
+            fichas_permitidas(request, allow_final=True) if request.user.is_authenticated else FichaAtencion.objects.all(),
+            numero_ticket=numero_ticket.upper())
         if not request.user.is_authenticated:
             rut = request.data.get("rut", "")
             if normalize_rut(rut) != ficha.propietario.rut_normalizado:
                 return Response({"detail": "Se requiere sesión interna o RUT del titular."}, status=403)
-        estrellas = int(request.data.get("estrellas", 5))
-        claridad = str(request.data.get("claridad", "Muy clara"))
-        rec = str(request.data.get("recomendaria", "Sí, totalmente"))
+        ser = EncuestaInputSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
         EncuestaSatisfaccion.objects.update_or_create(
             ficha=ficha,
-            defaults={"estrellas": max(1, min(5, estrellas)), "claridad": claridad, "recomendaria": rec},
+            defaults=ser.validated_data,
         )
         return Response({"saved": True}, status=201)
 
@@ -660,10 +794,10 @@ class CustodiaTrasladoView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(ClinicaRepository.base_ficha_queryset(), numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request, ClinicaRepository.base_ficha_queryset()), numero_ticket=numero_ticket.upper())
         ubicacion = str(request.data.get("ubicacion_custodia", "Sala de Profesores · Segundo Piso (INACAP)")).strip()
         resp = str(request.data.get("responsable_custodia", "Prof. Pablo E. Pesce Sánchez")).strip()
-        acta = f"ACTA-CUST-2026-{ficha.numero_ticket.replace('PC-', '')}"
+        acta = f"ACTA-{timezone.localdate().year}-E{ficha.evento_id}-{ficha.numero_ticket}"
 
         actor = _actor_label(request.user)
         TicketStateMachine.transition(
@@ -671,7 +805,7 @@ class CustodiaTrasladoView(APIView):
             "En custodia",
             actor,
             request.user,
-            note_text=f"CUSTODIA 18:00h: {ubicacion} · {resp} · {acta} (retención máx. 60 días Ley 21.719).",
+            note_text=f"CUSTODIA DE EQUIPO SIN RETIRAR: {ubicacion} · {resp} · {acta}.",
         )
         now = timezone.now()
         ficha.ubicacion_custodia = ubicacion
@@ -693,12 +827,14 @@ class CustodiaAnonimizarVencidosView(APIView):
     @transaction.atomic
     def post(self, request):
         today = timezone.now().date()
-        vencidas = FichaAtencion.objects.select_related("propietario").filter(
+        vencidas = fichas_permitidas(request).select_related("propietario").filter(
             estado="En custodia", fecha_limite_60_dias__lt=today
         )
         owners_done = 0
         for f in vencidas:
             ow = f.propietario
+            if ow.fichas.exclude(pk__in=vencidas.values("pk")).exists():
+                continue  # El titular puede tener una atención vigente en otra jornada o sede.
             if not ow.anonimizado:
                 ow.anonimizado = True
                 ow.anonimizado_en = timezone.now()
@@ -733,7 +869,7 @@ class ReportarIncidenciaView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(FichaAtencion, numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request), numero_ticket=numero_ticket.upper())
         desc = str(request.data.get("descripcion_incidencia", "")).strip()
         if not desc:
             return Response({"detail": "Describa la falla imprevista detectada."}, status=400)
@@ -757,7 +893,7 @@ class HallazgoIlicitoLey21459View(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(FichaAtencion, numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request), numero_ticket=numero_ticket.upper())
         ficha.hallazgo_ilicito_ley_21459 = True
         ficha.incidencia_activa = True
         ficha.descripcion_incidencia = (
@@ -793,7 +929,7 @@ class ResolverIncidenciaDocenteView(APIView):
 
     @transaction.atomic
     def post(self, request, numero_ticket: str):
-        ficha = get_object_or_404(FichaAtencion, numero_ticket=numero_ticket.upper())
+        ficha = get_object_or_404(fichas_permitidas(request), numero_ticket=numero_ticket.upper())
         accion = request.data.get("accion", "directriz")
         actor = _actor_label(request.user)
 
@@ -843,21 +979,22 @@ class AdminPlantillasView(APIView):
 
     def get(self, request):
         servicios = ServicioCatalogo.objects.filter(activo=True).order_by("id")
-        return Response(ServicioPlantillaSerializer(servicios, many=True).data)
+        return Response(ServicioPlantillaSerializer(servicios, many=True, context={"sede": evento_seleccionado(request).sede}).data)
 
     @transaction.atomic
     def put(self, request):
+        from clinica.patterns.plantillas import plantillas_para_sede
+        sede = evento_seleccionado(request).sede
         srv_nombre = request.data.get("servicio")
         tareas = [str(t).strip() for t in (request.data.get("tareas") or []) if str(t).strip()]
         if not srv_nombre or not tareas:
             return Response({"detail": "Especifique servicio y al menos una tarea."}, status=400)
 
-        srv = get_object_or_404(ServicioCatalogo, nombre=srv_nombre)
-        srv.version_actual += 1
-        srv.save(update_fields=["version_actual"])
+        srv = get_object_or_404(ServicioCatalogo.objects.select_for_update(), nombre=srv_nombre)
+        version = plantillas_para_sede(srv, sede)[1] + 1
 
         for idx, desc in enumerate(tareas, start=1):
-            PlantillaTarea.objects.create(servicio=srv, version=srv.version_actual, orden=idx, descripcion=desc[:255])
+            PlantillaTarea.objects.create(servicio=srv, sede=sede, version=version, orden=idx, descripcion=desc[:255])
 
         ClinicEventBus.get_instance().publish(
             "TEMPLATE_VERSIONED",
@@ -867,7 +1004,7 @@ class AdminPlantillasView(APIView):
                 "actor": _actor_label(request.user),
                 "ruta": request.path,
                 "ip": _client_ip(request),
-                "detalle": f"Plantilla '{srv.nombre}' actualizada a versión v{srv.version_actual}.0 ({len(tareas)} tareas).",
+                "detalle": f"Sede {sede.nombre}: plantilla '{srv.nombre}' actualizada a v{version} ({len(tareas)} tareas).",
             },
         )
         return self.get(request)
@@ -877,7 +1014,8 @@ class AdminNominaView(APIView):
     permission_classes = [IsDocentePO]
 
     def get(self, request):
-        perfiles = PerfilOperador.objects.select_related("user").filter(rol=ROLE_TECNICO).order_by("id")
+        sede = evento_seleccionado(request).sede
+        perfiles = PerfilOperador.objects.select_related("user").filter(rol=ROLE_TECNICO, sedes=sede).order_by("id")
         activos = perfiles.filter(habilitado_jornada=True).count()
         return Response(
             {
@@ -894,6 +1032,7 @@ class AdminNominaImportCSVView(APIView):
     @transaction.atomic
     def post(self, request):
         import hashlib
+        sede = evento_seleccionado(request).sede
 
         bus = ClinicEventBus.get_instance()
         registros = []
@@ -951,6 +1090,9 @@ class AdminNominaImportCSVView(APIView):
         for idx, (rut, nombre, seccion) in enumerate(registros, start=1):
             clean_rut = rut[:16]
             existing_perfil = PerfilOperador.objects.select_related("user").filter(rut=clean_rut).first()
+            if existing_perfil and not existing_perfil.sedes.filter(pk=sede.pk).exists():
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({"detail": "El operador ya existe en otra sede. Su vinculación debe realizarla un administrador autorizado."})
             if existing_perfil:
                 user = existing_perfil.user
                 if not user.has_usable_password():
@@ -980,6 +1122,7 @@ class AdminNominaImportCSVView(APIView):
             perfil.token_temporal_hash = tok_hash
             perfil.habilitado_jornada = True
             perfil.save()
+            perfil.sedes.add(sede)
 
         bus.publish(
             "CSV_MASS_IMPORT",
@@ -1000,10 +1143,17 @@ class AdminNominaRevokeView(APIView):
 
     @transaction.atomic
     def post(self, request):
+        sede = evento_seleccionado(request).sede
         perfiles = PerfilOperador.objects.select_related("user").filter(rol=ROLE_TECNICO)
         count = 0
         for p in perfiles:
+            if not p.sedes.filter(pk=sede.pk).exists():
+                continue
             if p.user.username not in ("diego.astudillo", "daniel.meliman"):
+                p.sedes.remove(sede)
+                if p.sedes.exists():
+                    count += 1
+                    continue
                 p.habilitado_jornada = False
                 p.save(update_fields=["habilitado_jornada"])
                 p.user.is_active = False
@@ -1028,7 +1178,7 @@ class MetricasView(APIView):
     permission_classes = [IsDocentePO]
 
     def get(self, request):
-        return Response(ClinicaRepository.get_metrics_summary())
+        return Response(ClinicaRepository.get_metrics_summary(fichas_permitidas(request)))
 
 
 class ExportarMetricasCSVView(APIView):
@@ -1042,7 +1192,7 @@ class ExportarMetricasCSVView(APIView):
         response.write("\ufeff")
         writer = csv.writer(response)
         writer.writerow(["Ticket", "Dispositivo", "Serie_o_Clon", "Titular", "RUT", "Servicios", "Estado"])
-        for f in ClinicaRepository.base_ficha_queryset().all():
+        for f in fichas_permitidas(request, ClinicaRepository.base_ficha_queryset()):
             writer.writerow(
                 [
                     sanitize_csv_cell(f.numero_ticket),
@@ -1061,7 +1211,10 @@ class SeguridadAuditoriaView(APIView):
     permission_classes = [IsDocentePO]
 
     def get(self, request):
-        logs = EventoSeguridadOWASP.objects.all()[:60]
+        logs = EventoSeguridadOWASP.objects.all()
+        if not request.user.is_superuser:
+            logs = logs.filter(sede__in=sedes_permitidas(request.user))
+        logs = logs[:60]
         return Response(
             {
                 "database_engine": f"PostgreSQL ({connection.settings_dict['NAME']})",

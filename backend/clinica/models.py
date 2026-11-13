@@ -5,8 +5,79 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db import transaction
+from datetime import time, timedelta
 
 from clinica.security.validators import format_rut_chileno, normalize_rut, validate_rut_field
+
+
+class Sede(models.Model):
+    nombre = models.CharField(max_length=120, unique=True)
+    codigo = models.SlugField(max_length=60, unique=True)
+    direccion = models.CharField(max_length=200, blank=True, default="")
+    activa = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ["nombre"]
+
+    def __str__(self):
+        return self.nombre
+
+
+class EventoClinica(models.Model):
+    ESTADOS = [(s, s) for s in ("Borrador", "Inscripciones abiertas", "En curso", "Finalizado")]
+    sede = models.ForeignKey(Sede, on_delete=models.PROTECT, related_name="eventos")
+    nombre = models.CharField(max_length=160)
+    fecha_inicio = models.DateField()
+    fecha_fin = models.DateField()
+    lugar = models.CharField(max_length=200)
+    estado = models.CharField(max_length=30, choices=ESTADOS, default="Borrador")
+    creado_por = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    creado_en = models.DateTimeField(auto_now_add=True)
+    permite_continuidad = models.BooleanField(default=False)
+    inscripcion_desde = models.DateTimeField(null=True, blank=True)
+    inscripcion_hasta = models.DateTimeField(null=True, blank=True)
+
+    @transaction.atomic
+    def save(self, *args, **kwargs):
+        nuevo = self._state.adding
+        super().save(*args, **kwargs)
+        if nuevo:
+            days = (self.fecha_fin - self.fecha_inicio).days + 1
+            if not 1 <= days <= 366:
+                raise ValidationError('El evento debe durar entre 1 y 366 días.')
+            JornadaEvento.objects.bulk_create([
+                JornadaEvento(evento=self, fecha=self.fecha_inicio + timedelta(days=i),
+                    estado='Abierta' if i == 0 and self.estado == 'En curso' else 'Pendiente')
+                for i in range(days)
+            ])
+
+    class Meta:
+        ordering = ["-fecha_inicio", "-id"]
+
+    def __str__(self):
+        return f"{self.nombre} · {self.sede}"
+
+
+class JornadaEvento(models.Model):
+    evento = models.ForeignKey(EventoClinica, on_delete=models.PROTECT, related_name='jornadas')
+    fecha = models.DateField()
+    apertura = models.TimeField(default=time(9, 0))
+    cierre = models.TimeField(default=time(18, 0))
+    limite_recepcion = models.TimeField(default=time(18, 0))
+    estado = models.CharField(max_length=16, choices=[(v,v) for v in ['Pendiente','Abierta','Cerrada','No realizada']], default='Pendiente')
+
+    class Meta:
+        ordering = ['fecha']
+        unique_together = [('evento','fecha')]
+
+
+class ParticipacionJornada(models.Model):
+    jornada = models.ForeignKey(JornadaEvento, on_delete=models.CASCADE, related_name='participantes')
+    operador = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+
+    class Meta:
+        unique_together = [('jornada','operador')]
 
 
 class Propietario(models.Model):
@@ -87,6 +158,7 @@ class ServicioCatalogo(models.Model):
 
 
 class PlantillaTarea(models.Model):
+    sede = models.ForeignKey(Sede, on_delete=models.PROTECT, null=True, blank=True, related_name="plantillas")
     servicio = models.ForeignKey(ServicioCatalogo, on_delete=models.CASCADE, related_name="plantillas")
     version = models.PositiveIntegerField(default=1)
     orden = models.PositiveIntegerField()
@@ -95,7 +167,7 @@ class PlantillaTarea(models.Model):
     class Meta:
         verbose_name = "Tarea de Plantilla"
         verbose_name_plural = "Plantillas de Tareas"
-        unique_together = [("servicio", "version", "orden")]
+        unique_together = [("servicio", "sede", "version", "orden")]
         ordering = ["servicio_id", "version", "orden"]
 
     def __str__(self):
@@ -110,6 +182,7 @@ class PerfilOperador(models.Model):
     ]
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="perfil")
+    sedes = models.ManyToManyField(Sede, related_name="operadores", blank=True)
     rol = models.CharField(max_length=20, choices=ROLES)
     rut = models.CharField(max_length=16, unique=True, null=True, blank=True)
     seccion = models.CharField(max_length=20, blank=True, default="TI3043-01")
@@ -140,6 +213,13 @@ class FichaAtencion(models.Model):
     ]
 
     numero_ticket = models.CharField(max_length=16, unique=True, db_index=True)
+    evento = models.ForeignKey(EventoClinica, on_delete=models.PROTECT, related_name="fichas")
+    jornada_preferida = models.ForeignKey(JornadaEvento, on_delete=models.PROTECT, null=True, blank=True, related_name='preinscripciones')
+    jornada_recepcion = models.ForeignKey(JornadaEvento, on_delete=models.PROTECT, null=True, blank=True, related_name='recepciones')
+    verificado_salida_en = models.DateTimeField(null=True, blank=True)
+    derivacion_destino = models.CharField(max_length=160, blank=True, default='')
+    derivacion_motivo = models.TextField(blank=True, default='')
+    derivacion_registrada_en = models.DateTimeField(null=True, blank=True)
     propietario = models.ForeignKey(Propietario, on_delete=models.PROTECT, related_name="fichas")
     dispositivo = models.ForeignKey(Dispositivo, on_delete=models.PROTECT, related_name="fichas")
     servicios = models.ManyToManyField(ServicioCatalogo, related_name="fichas")
@@ -185,6 +265,14 @@ class FichaAtencion(models.Model):
     tercero_rut = models.CharField(max_length=16, blank=True, default="")
     tercero_autorizado_telefono = models.BooleanField(default=False)
     resultado_entrega = models.CharField(max_length=40, blank=True, default="")
+    prueba_conjunta_resultado = models.CharField(max_length=24, blank=True, default="")
+    prueba_conjunta_observaciones = models.TextField(blank=True, default="")
+    receptor_confirma_prueba = models.BooleanField(default=False)
+    entrega_registrada_en = models.DateTimeField(null=True, blank=True)
+    entrega_registrada_por = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="entregas_registradas",
+    )
 
     # Custodia 18:00 hrs & retención 60 días (Ley 21.719)
     ubicacion_custodia = models.CharField(max_length=140, blank=True, default="")
@@ -203,6 +291,23 @@ class FichaAtencion(models.Model):
 
     def __str__(self):
         return f"{self.numero_ticket} [{self.estado}] - {self.dispositivo.marca_modelo}"
+
+
+class ResguardoEntreJornadas(models.Model):
+    ficha = models.ForeignKey(FichaAtencion, on_delete=models.PROTECT, related_name='resguardos')
+    desde = models.ForeignKey(JornadaEvento, on_delete=models.PROTECT, related_name='resguardos_salientes')
+    hasta = models.ForeignKey(JornadaEvento, on_delete=models.PROTECT, related_name='resguardos_entrantes')
+    lugar = models.CharField(max_length=200)
+    responsable = models.CharField(max_length=160)
+    motivo = models.TextField()
+    titular_autoriza = models.BooleanField()
+    autorizado_por = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='resguardos_autorizados')
+    registrado_en = models.DateTimeField(auto_now_add=True)
+    reanudado_en = models.DateTimeField(null=True, blank=True)
+    reanudado_por = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name='resguardos_reanudados')
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['ficha'], condition=models.Q(reanudado_en__isnull=True), name='resguardo_activo_unico')]
 
 
 class ChecklistItemEjecucion(models.Model):
@@ -236,6 +341,7 @@ class BitacoraNota(models.Model):
     autor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
     autor_nombre = models.CharField(max_length=120)
     contenido = models.TextField()
+    privada_meson = models.BooleanField(default=False)
     creado_en = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -287,6 +393,7 @@ class EventoSeguridadOWASP(models.Model):
     NIVELES = [("INFO", "INFO"), ("WARN", "WARN"), ("CRITICAL", "CRITICAL")]
 
     nivel = models.CharField(max_length=16, choices=NIVELES, default="INFO")
+    sede = models.ForeignKey(Sede, on_delete=models.SET_NULL, null=True, blank=True, related_name="auditoria")
     evento = models.CharField(max_length=60, db_index=True)
     usuario = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
     actor_nombre = models.CharField(max_length=100, blank=True, default="")

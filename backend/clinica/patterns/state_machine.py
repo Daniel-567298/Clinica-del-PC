@@ -80,6 +80,7 @@ class TicketStateMachine:
         actor_name: str,
         user=None,
         note_text: str = "",
+        note_private: bool = False,
     ) -> FichaAtencion:
         ok, reason = cls.can_transition(ficha, target_state)
         if not ok:
@@ -111,6 +112,7 @@ class TicketStateMachine:
                 autor=user if getattr(user, "is_authenticated", False) else None,
                 autor_nombre=actor_name[:120],
                 contenido=note_text,
+                privada_meson=note_private,
             )
 
         return ficha

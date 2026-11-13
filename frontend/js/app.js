@@ -22,6 +22,8 @@
   ];
 
   const VIEW_ROLES = {
+    eventos: ['RECEPCIONISTA', 'TECNICO', 'DOCENTE_PO'],
+    jornadas: ['RECEPCIONISTA', 'TECNICO', 'DOCENTE_PO'],
     qr: ['PUBLIC', 'RECEPCIONISTA', 'TECNICO', 'DOCENTE_PO'],
     lookup: ['PUBLIC', 'RECEPCIONISTA', 'TECNICO', 'DOCENTE_PO'],
     ticket_ok: ['PUBLIC', 'RECEPCIONISTA', 'TECNICO', 'DOCENTE_PO'],
@@ -69,6 +71,7 @@
   }
 
   const state = {
+    sedes: [], eventos: [], sedeId: '', eventoId: '', eventYear: '', contextLoaded: false, contextError: '',
     auth: { authenticated: false, rol: 'PUBLIC', full_name: '', username: '', seccion: '' },
     dbOk: false,
     dbVendor: 'postgresql',
@@ -103,6 +106,56 @@
   const toastStackEl = document.getElementById('toast-stack');
   const modalBackdropEl = document.getElementById('app-modal');
   const modalContentEl = document.getElementById('app-modal-content');
+  const eventContextEl = document.getElementById('event-context');
+  const activeEvent = () => state.eventos.find(e => String(e.id) === String(state.eventoId));
+
+  async function loadEventContext() {
+    const [sedes, eventos] = await Promise.all([API.get('/sedes/'), API.get('/eventos/')]);
+    if (!Array.isArray(sedes) || !Array.isArray(eventos)) throw new Error('No se pudo interpretar el catálogo de sedes y eventos.');
+    state.sedes = sedes; state.eventos = eventos;
+    const requested = new URLSearchParams(location.search).get('evento');
+    const chosen = eventos.find(e => String(e.id) === String(state.eventoId || requested)) ||
+      (!requested ? eventos.find(e => ['En curso', 'Inscripciones abiertas'].includes(e.estado)) || eventos[0] : null);
+    state.eventoId = chosen?.id || ''; state.sedeId = chosen?.sede || sedes[0]?.id || '';
+    API.setEvento(state.eventoId);
+    state.contextLoaded = true; state.contextError = '';
+  }
+
+  function renderEventContext() {
+    const options = state.eventos.filter(e => String(e.sede) === String(state.sedeId));
+    const event = activeEvent();
+    eventContextEl.innerHTML = `
+      <label>Sede INACAP<select id="context-sede" ${!state.sedes.length ? 'disabled' : ''}>${state.sedes.length ? state.sedes.map(s => `<option value="${s.id}" ${String(s.id) === String(state.sedeId) ? 'selected' : ''}>${esc(s.nombre)}</option>`).join('') : `<option>${state.contextError ? 'No se pudo cargar el catálogo' : state.contextLoaded ? 'Sin sedes disponibles' : 'Cargando sedes…'}</option>`}</select></label>
+      <label>Evento de la Clínica del PC<select id="context-evento"><option value="">${options.length ? 'Selecciona un evento' : 'Sin eventos disponibles'}</option>${options.map(e => `<option value="${e.id}" ${String(e.id) === String(state.eventoId) ? 'selected' : ''}>${esc(e.nombre)} · ${esc(e.fecha_inicio)} · ${esc(e.estado)}</option>`).join('')}</select></label>
+      ${event ? `<span class="status-pill">${esc(event.estado)}${event.estado === 'Finalizado' ? ' · Solo lectura' : ''}</span>` : ''}`;
+    const sede = state.sedes.find(s => String(s.id) === String(state.sedeId));
+    document.querySelector('.brand-titles p').textContent = sede ? `Sede ${sede.nombre} · Atención y Soporte Técnico` : 'Clínica del PC · INACAP';
+    document.querySelector('.app-footer span').textContent = sede ? `Clínica del PC · INACAP Sede ${sede.nombre}` : 'Clínica del PC · INACAP';
+  }
+
+  async function changeEvent(id, targetView = null) {
+    state.eventoId = id; API.setEvento(id); state.activeFicha = null;
+    const url = new URL(location.href); if (id) url.searchParams.set('evento', id); else url.searchParams.delete('evento');
+    history.replaceState(null, '', url);
+    state.activeTicketNumber = ''; state.triajeQuery = ''; state.triajeData = null;
+    state.metricasData = null; state.qrPrefill = null;
+    if (state.auth.authenticated) {
+      await loadFichasList();
+      if (state.activeTicketNumber) await loadActiveFicha(state.activeTicketNumber);
+      await navigate(id ? (targetView || (state.currentView === 'eventos' ? 'eventos' : state.auth.rol === 'DOCENTE_PO' ? 'metricas' : state.auth.rol === 'TECNICO' ? 'taller' : 'mesa')) : 'eventos');
+    } else { state.currentView = 'qr'; renderAll(); }
+  }
+
+  eventContextEl.addEventListener('change', async ev => {
+    try {
+      if (ev.target.id === 'context-sede') {
+        state.sedeId = ev.target.value;
+        state.eventYear = '';
+        const options = state.eventos.filter(e => String(e.sede) === String(state.sedeId));
+        await changeEvent((options.find(e => ['En curso', 'Inscripciones abiertas'].includes(e.estado)) || options[0])?.id || '');
+      } else if (ev.target.id === 'context-evento') { await changeEvent(ev.target.value); }
+    } catch (err) { showToast(err.message, 'danger'); }
+  });
 
   // ---------------------------------------------------------------------------
   // UTILIDADES UI
@@ -248,15 +301,18 @@
               const isAct = state.currentView === s.view;
               const isDone = s.idx <= currentStepIdx && !isAct;
               const canOpen = hasRole(s.view);
+              const requiredRoles = (VIEW_ROLES[s.view] || []).map(roleShortLabel).join(' o ');
+              const permissionHint = canOpen ? '' : `Sin acceso con tu perfil. Disponible para ${requiredRoles}.`;
               return `
                 ${i > 0 ? '<span class="tp-sep">/</span>' : ''}
-                <button type="button" class="tp-step ${isAct ? 'active' : ''} ${isDone ? 'done' : ''}" data-step-goto="${esc(s.view)}" ${canOpen ? '' : 'disabled'}>
-                  ${esc(s.label)}
+                <button type="button" class="tp-step ${isAct ? 'active' : ''} ${isDone ? 'done' : ''} ${canOpen ? '' : 'restricted'}" data-step-goto="${esc(s.view)}" ${canOpen ? '' : `aria-disabled="true" title="${esc(permissionHint)}" aria-label="${esc(s.label + '. ' + permissionHint)}"`}>
+                  ${canOpen ? '' : ico('lock')} ${esc(s.label)}
                 </button>
               `;
             })
             .join('')}
         </div>
+        ${flowSteps.some(s => !hasRole(s.view)) ? '<p class="ticket-permission-hint">Las etapas con candado requieren otro perfil. Selecciona una para consultar quién tiene acceso.</p>' : ''}
       </div>
     `;
   }
@@ -289,6 +345,14 @@
       state.auth = { authenticated: false, rol: 'PUBLIC' };
     }
 
+    try {
+      await loadEventContext();
+    } catch (err) {
+      state.contextLoaded = false; state.contextError = 'No se pudieron cargar las sedes y los eventos. Reintenta la conexión.';
+      state.sedes = []; state.eventos = []; state.eventoId = ''; state.sedeId = '';
+      API.setEvento?.(''); state.fichasList = []; state.activeFicha = null;
+      renderAll(); return;
+    }
     if (state.auth.authenticated) {
       await loadFichasList();
       if (!keepView) {
@@ -296,6 +360,7 @@
         else if (state.auth.rol === 'TECNICO') state.currentView = 'taller';
         else if (state.auth.rol === 'DOCENTE_PO') state.currentView = 'metricas';
       }
+      if (!state.eventoId) state.currentView = 'eventos';
       await loadActiveFicha(state.activeTicketNumber);
       await navigate(state.currentView);
       return;
@@ -311,9 +376,11 @@
 
   async function loadFichasList() {
     if (!state.auth.authenticated) return;
+    if (!state.eventoId) { state.fichasList = []; state.activeFicha = null; state.activeTicketNumber = ''; return; }
     try {
       const rows = await timedApi(() => API.get('/fichas/'));
       state.fichasList = Array.isArray(rows) ? rows : [];
+      if (!state.fichasList.length) { state.activeFicha = null; state.activeTicketNumber = ''; }
       if (state.fichasList.length && !state.fichasList.some(f => f.numero_ticket === state.activeTicketNumber)) {
         state.activeTicketNumber = state.fichasList[0].numero_ticket;
       }
@@ -339,6 +406,7 @@
   // RENDERIZADO DEL SHELL (HEADER, SIDEBAR CONTEXTUAL)
   // ---------------------------------------------------------------------------
   function renderHeaderAndBar() {
+    renderEventContext();
     const isAuth = Boolean(state.auth.authenticated);
     appShellEl.classList.toggle('is-public', !isAuth);
 
@@ -347,7 +415,7 @@
       userChipEl.innerHTML = `<span class="user-avatar">${esc(initials(state.auth.full_name))}</span><span>${esc(state.auth.full_name)} · ${esc(roleShortLabel(state.auth.rol))}</span>`;
       btnOpenAuth.textContent = 'Cambiar cuenta';
       btnLogout.style.display = 'inline-flex';
-      pickerWrapEl.style.display = 'flex';
+      pickerWrapEl.style.display = state.fichasList.length ? 'flex' : 'none';
 
       ticketSelectEl.innerHTML = state.fichasList
         .map(f => {
@@ -374,6 +442,8 @@
       {
         title: 'Mesón y Taller',
         items: [
+          { id: 'eventos', icon: 'clock', label: 'Eventos y sedes' },
+          { id: 'jornadas', icon: 'clock', label: 'Días y participantes' },
           { id: 'mesa', icon: 'users', label: 'Triaje por RUT' },
           { id: 'ingreso', icon: 'clipboard', label: 'Recepción e Inspección' },
           { id: 'taller', icon: 'wrench', label: 'Checklist de Taller' },
@@ -433,7 +503,10 @@
   async function navigate(viewId) {
     state.currentView = viewId;
     if (state.auth.authenticated) {
-      if (viewId === 'mesa') {
+      if (viewId === 'jornadas' && state.eventoId) {
+        const [days, operators, metrics] = await Promise.all([API.get(`/eventos/${state.eventoId}/jornadas/`), state.auth.rol === 'DOCENTE_PO' ? API.get('/sedes/operadores/') : [], state.auth.rol === 'DOCENTE_PO' ? API.get(`/eventos/${state.eventoId}/metricas-diarias/`) : null]);
+        state.days = days; state.operators = operators; state.dailyMetrics = metrics;
+      } else if (viewId === 'mesa') {
         await fetchTriaje(state.triajeQuery);
       } else if (['ingreso', 'taller', 'bitacora', 'prueba', 'aviso', 'salida', 'custodia', 'incidencias', 'print'].includes(viewId)) {
         await loadActiveFicha(state.activeTicketNumber);
@@ -451,7 +524,21 @@
   function renderAll() {
     renderHeaderAndBar();
     renderSidebar();
+    if (state.contextError) {
+      mainEl.innerHTML = `<div class="card"><h2>No se pudo cargar la información de atención</h2><p>${esc(state.contextError)}</p><button type="button" class="btn btn-primary" id="retry-event-context">Reintentar carga</button></div>`;
+      mainEl.querySelector('#retry-event-context').addEventListener('click', () => refreshSession(false));
+      return;
+    }
+    if (!state.contextLoaded) {
+      mainEl.innerHTML = '<div class="card" role="status">Cargando sedes y eventos…</div>';
+      return;
+    }
     renderCurrentView();
+    renderContinuityActions();
+    if (activeEvent()?.estado === 'Finalizado' && !['eventos', 'aviso', 'salida'].includes(state.currentView)) {
+      mainEl.insertAdjacentHTML('afterbegin', '<div class="notice notice-info"><span>Evento finalizado. El taller es de solo lectura; los retiros posteriores siguen disponibles en Aviso y Entrega.</span></div>');
+      mainEl.querySelectorAll('form button[type="submit"], form input, form textarea, form select').forEach(el => { el.disabled = true; });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -626,8 +713,14 @@
       renderAccessDeniedCard();
       return;
     }
+    if (['ingreso', 'taller', 'bitacora', 'prueba', 'aviso', 'salida', 'custodia', 'incidencias', 'print'].includes(state.currentView) && !state.activeFicha) {
+      mainEl.innerHTML = '<div class="card"><h2>No hay una ficha seleccionada en este evento</h2><p>Selecciona una jornada con atenciones o registra un equipo para comenzar.</p></div>';
+      return;
+    }
 
     switch (state.currentView) {
+      case 'eventos': return renderEventosScreen();
+      case 'jornadas': return renderJornadasScreen();
       case 'qr':
         return renderQrScreen();
       case 'lookup':
@@ -689,7 +782,7 @@
       <div class="public-header-row">
         <div>
           <h2 class="page-title">Atención Clínica del PC</h2>
-          <p class="page-desc">Servicio técnico gratuito realizado por estudiantes de Informática INACAP Sede San Pedro de la Paz.</p>
+          <p class="page-desc">Servicio técnico gratuito realizado por estudiantes de Informática INACAP · ${esc(activeEvent()?.sede_nombre || '')}.</p>
         </div>
         <div class="segmented-tabs" role="tablist">
           <button type="button" class="seg-tab ${activeTab === 'qr' ? 'active' : ''}" id="tab-pub-qr">
@@ -721,7 +814,7 @@
             ${ico('lock')}
             <div>
               <strong>Retiro y custodia nocturna</strong>
-              Los equipos se entregan antes de las 18:00 hrs. Los no retirados quedan en custodia en Sala de Profesores (máx. 60 días).
+              Consulta los horarios de cada día al seleccionar tu fecha de atención. El retiro se coordina con mesón; la permanencia entre días requiere autorización expresa.
             </div>
           </div>
           <div class="info-list-item">
@@ -740,6 +833,10 @@
   // VISTA 1: PREINSCRIPCIÓN PÚBLICA QR
   // ---------------------------------------------------------------------------
   function renderQrScreen() {
+    if (!activeEvent() || !['Inscripciones abiertas', 'En curso'].includes(activeEvent().estado)) {
+      mainEl.innerHTML = '<div class="card"><h2>No hay inscripciones abiertas para esta selección</h2><p>Elige una sede y una jornada con inscripciones abiertas o en curso.</p></div>';
+      return;
+    }
     const pf = state.qrPrefill || {};
     const prefillNotice = state.qrPrefill
       ? `<div class="notice notice-info"><span>Datos prellenados para <strong>${esc(pf.nombre_completo)}</strong> (<span class="mono">${esc(pf.rut)}</span>).</span><button type="button" class="btn btn-outline btn-sm" id="btn-clear-prefill">Limpiar</button></div>`
@@ -759,6 +856,10 @@
           </div>
 
           <form id="qr-form" class="form-grid">
+            <label class="form-full">Día de atención preferido
+              <select id="qr-dia" required>${(activeEvent()?.jornadas || []).filter(j => !['Cerrada','No realizada'].includes(j.estado)).map(j => `<option value="${j.id}">${esc(j.fecha)} · ${esc(j.apertura.slice(0,5))} a ${esc(j.cierre.slice(0,5))} · Recepción hasta ${esc(j.limite_recepcion.slice(0,5))}</option>`).join('')}</select>
+              <small>Es una preferencia. Mesón registra el día efectivo de recepción.</small>
+            </label>
             <label>Nombre completo del titular
               <input id="qr-nombre" type="text" required value="${esc(pf.nombre_completo || '')}" placeholder="Ej: Camila Rojas Méndez">
             </label>
@@ -848,6 +949,7 @@
             tipo: mainEl.querySelector('#qr-tipo').value,
             marca_modelo: mainEl.querySelector('#qr-modelo').value.trim(),
             problema_declarado: mainEl.querySelector('#qr-problema').value.trim(),
+            jornada_preferida: Number(mainEl.querySelector('#qr-dia').value),
             servicios,
           })
         );
@@ -1944,10 +2046,27 @@
             </label>
           </div>
 
-          <div id="ent-err" class="form-full"></div>
+          <fieldset class="form-full form-grid delivery-proof">
+            <legend>Prueba conjunta con quien retira</legend>
+            <label>Resultado de la prueba
+              <select id="ent-prueba" required>
+                <option value="">Selecciona un resultado</option>
+                ${['Conforme', 'No conforme', 'No se pudo probar'].map(value => `<option value="${value}" ${f.prueba_conjunta_resultado === value ? 'selected' : ''}>${value}</option>`).join('')}
+              </select>
+            </label>
+            <label class="form-full">Observaciones (obligatorias si no está conforme o no se pudo probar)
+              <textarea id="ent-prueba-obs" maxlength="2000">${esc(f.prueba_conjunta_observaciones || '')}</textarea>
+            </label>
+            <label class="checkbox-tile form-full">
+              <input id="ent-prueba-confirma" type="checkbox" required ${f.receptor_confirma_prueba ? 'checked' : ''}>
+              <span>Confirmo que el resultado o la imposibilidad de realizar la prueba fue revisado con quien retira.</span>
+            </label>
+            ${f.entrega_registrada_en ? `<p class="form-full">Constancia registrada el ${esc(new Date(f.entrega_registrada_en).toLocaleString('es-CL'))}.</p>` : ''}
+          </fieldset>
+          <div id="ent-err" class="form-full" role="alert"></div>
           <div class="form-full" style="display:flex; justify-content:flex-end; gap:8px;">
             <button type="button" class="btn btn-outline" id="btn-go-print">${ico('printer')} Comprobante</button>
-            <button type="submit" class="btn btn-success">Confirmar entrega</button>
+            <button type="submit" class="btn btn-success" ${f.resultado_entrega ? 'disabled' : ''}>${f.resultado_entrega ? 'Entrega ya registrada' : 'Confirmar entrega'}</button>
           </div>
         </form>
       </div>
@@ -2017,6 +2136,9 @@
             tercero_nombre: mainEl.querySelector('#ent-t-nom').value.trim(),
             tercero_rut: mainEl.querySelector('#ent-t-rut').value.trim(),
             tercero_autorizado_telefono: mainEl.querySelector('#ent-t-auth').checked,
+            prueba_conjunta_resultado: mainEl.querySelector('#ent-prueba').value,
+            prueba_conjunta_observaciones: mainEl.querySelector('#ent-prueba-obs').value.trim(),
+            receptor_confirma_prueba: mainEl.querySelector('#ent-prueba-confirma').checked,
           })
         );
         await loadFichasList();
@@ -2060,8 +2182,8 @@
       <div class="card">
         <div class="card-header">
           <div>
-            <h2 class="card-title">${ico('lock')} Custodia nocturna (18:00 hrs) y retención</h2>
-            <p class="card-subtitle">Resguardo de equipos no retirados al cierre de jornada · Plazo legal máximo 60 días</p>
+            <h2 class="card-title">${ico('lock')} Custodia al cierre y resguardo</h2>
+            <p class="card-subtitle">Equipos no retirados al cierre · La continuidad de un trabajo entre días se autoriza por separado</p>
           </div>
           ${
             state.auth.rol === 'DOCENTE_PO'
@@ -2263,7 +2385,7 @@
         <div class="card-header">
           <div>
             <h2 class="card-title">${ico('printer')} Comprobante de atención — Clínica del PC INACAP</h2>
-            <p class="card-subtitle">Orden <span class="mono">${esc(f.numero_ticket)}</span> · Dispositivo <span class="mono">${esc(f.dispositivo?.codigo_dispositivo)}</span> · Sede San Pedro de la Paz</p>
+            <p class="card-subtitle">Orden <span class="mono">${esc(f.numero_ticket)}</span> · ${esc(f.evento_nombre)} · Sede ${esc(f.sede_nombre)}</p>
           </div>
           <button type="button" class="btn btn-primary btn-sm" id="btn-do-print">${ico('printer')} Imprimir / Guardar PDF</button>
         </div>
@@ -2440,6 +2562,145 @@
   // ---------------------------------------------------------------------------
   // MÉTRICAS & EXPORTACIÓN CSV
   // ---------------------------------------------------------------------------
+  function renderEventosScreen() {
+    const docente = state.auth.rol === 'DOCENTE_PO';
+    const scoped = state.eventos.filter(e => String(e.sede) === String(state.sedeId));
+    const years = [...new Set(scoped.map(e => e.fecha_inicio.slice(0, 4)))].sort().reverse();
+    const visible = scoped.filter(e => !state.eventYear || e.fecha_inicio.startsWith(state.eventYear));
+    mainEl.innerHTML = `
+      <div class="card"><div class="card-header"><div><h2 class="card-title">Eventos de la Clínica del PC</h2><p class="card-subtitle">Cada evento conserva sus fichas y métricas; dentro de él puedes planificar uno o más días. Cambia de sede con el selector superior.</p></div></div>
+        <label>Año<select id="event-year"><option value="">Todos los años</option>${years.map(y => `<option ${y === state.eventYear ? 'selected' : ''}>${y}</option>`).join('')}</select></label>
+        <div class="event-history">${visible.map(e => `<article class="event-card">
+          <div><h3>${esc(e.nombre)}</h3><p>${esc(e.sede_nombre)} · ${esc(e.fecha_inicio)} al ${esc(e.fecha_fin)}</p><p>${esc(e.lugar)}</p></div>
+          <div><span class="status-pill">${esc(e.estado)}</span> · ${e.total_fichas ?? 0} fichas</div>
+          <div class="event-actions"><button type="button" class="btn btn-outline" data-event-days="${e.id}">Días y participantes</button><button type="button" class="btn btn-primary" data-event-open="${e.id}">Ver atenciones</button>
+          ${['En curso', 'Inscripciones abiertas'].includes(e.estado) ? `<a class="btn btn-outline" href="/?evento=${e.id}" target="_blank" rel="noopener">Enlace de inscripción</a>` : ''}
+          ${docente ? `<button type="button" class="btn btn-outline" data-event-metrics="${e.id}">Ver métricas</button>` : ''}
+          ${docente ? ({Borrador: ['Inscripciones abiertas'], 'Inscripciones abiertas': ['En curso', 'Finalizado'], 'En curso': ['Finalizado'], Finalizado: ['En curso']}[e.estado] || []).map(st => `<button type="button" class="btn btn-outline" data-event-state="${e.id}" data-target-state="${st}">${e.estado === 'Finalizado' ? 'Reabrir evento' : st === 'Finalizado' ? 'Finalizar evento' : st === 'En curso' ? 'Iniciar evento' : 'Abrir inscripciones'}</button>`).join('') : ''}</div>
+          ${docente ? `<details><summary>Preparar otra edición desde este evento</summary><form class="form-grid" data-event-copy="${e.id}"><label>Nombre de la nueva edición<input name="nombre" required maxlength="160"></label><label>Primer día<input name="fecha_inicio" type="date" required></label><p class="form-full">Copia duración, lugar y horarios. Las fichas, participantes y autorizaciones comienzan vacíos.</p><button type="submit" class="btn btn-outline">Crear borrador</button></form></details>` : ''}
+          ${docente && e.estado === 'Finalizado' ? `<label>Motivo de reapertura<input id="event-reason-${e.id}" placeholder="Solo si necesitas continuar una atención pendiente"></label>` : ''}
+        </article>`).join('') || '<p>No hay eventos para esta selección.</p>'}</div>
+      </div>
+      ${docente ? `<div class="card"><h2>Crear un evento en esta sede</h2><p class="card-subtitle">Se crea como borrador. Abre sus inscripciones cuando esté preparado.</p>
+        <form id="event-create-form" class="form-grid"><label class="form-full">Nombre<input id="event-name" maxlength="160" required placeholder="Clínica del PC · Jornada 2027"></label>
+        <label>Fecha de inicio<input id="event-start" type="date" required></label><label>Fecha de término<input id="event-end" type="date" required></label>
+        <label class="form-full">Lugar de atención<input id="event-place" maxlength="200" required></label>
+        <div class="form-full"><button class="btn btn-primary" type="submit" ${!state.sedeId ? 'disabled' : ''}>Crear evento</button></div></form></div>
+      <div class="card"><h2>Registrar otra sede INACAP</h2><form id="sede-create-form" class="form-grid">
+        <label>Nombre de la sede<input id="sede-name" required maxlength="120"></label><label>Código único<input id="sede-code" pattern="[a-z0-9-]+" placeholder="ejemplo-sede" required maxlength="60"></label>
+        <label class="form-full">Dirección<input id="sede-address" maxlength="200"></label>
+        <p class="form-full">El docente creador obtiene acceso. Puedes habilitar otros operadores en la sección siguiente.</p>
+        <div class="form-full"><button class="btn btn-outline" type="submit">Registrar sede</button></div></form></div>
+        <div class="card"><h2>Habilitar operador en la sede seleccionada</h2><form id="sede-operator-form" class="form-grid">
+          <label class="form-full">Operador<select id="sede-operator" required><option value="">Cargando operadores…</option></select></label>
+          <div class="form-full"><button class="btn btn-outline" type="submit">Habilitar en esta sede</button></div></form></div>` : ''}`;
+    mainEl.querySelectorAll('[data-event-days]').forEach(b => b.addEventListener('click', async () => { try { await changeEvent(b.dataset.eventDays, 'jornadas'); } catch (err) { showToast(err.message, 'danger'); } }));
+    mainEl.querySelectorAll('[data-event-copy]').forEach(form => form.addEventListener('submit', async ev => { ev.preventDefault(); try { const row = await API.post(`/eventos/${form.dataset.eventCopy}/copiar/`, Object.fromEntries(new FormData(form))); state.eventoId = row.id; await loadEventContext(); await changeEvent(row.id, 'jornadas'); showToast('Nueva edición creada como borrador.', 'success'); } catch (err) { showToast(err.message, 'danger'); } }));
+    mainEl.querySelector('#event-year').addEventListener('change', ev => { state.eventYear = ev.target.value; renderEventosScreen(); });
+    mainEl.querySelectorAll('[data-event-open], [data-event-metrics]').forEach(button => button.addEventListener('click', async () => {
+      try { const metrics = button.hasAttribute('data-event-metrics'); state.currentView = metrics ? 'metricas' : state.auth.rol === 'TECNICO' ? 'taller' : 'mesa';
+        await changeEvent(button.dataset.eventOpen || button.dataset.eventMetrics, metrics ? 'metricas' : state.auth.rol === 'TECNICO' ? 'taller' : 'mesa');
+      } catch (err) { showToast(err.message, 'danger'); }
+    }));
+    mainEl.querySelectorAll('[data-event-state]').forEach(button => button.addEventListener('click', async () => {
+      mainEl.querySelectorAll('[data-event-state]').forEach(el => { el.disabled = true; });
+      try { await API.post(`/eventos/${button.dataset.eventState}/estado/`, {estado: button.dataset.targetState, motivo: mainEl.querySelector(`#event-reason-${button.dataset.eventState}`)?.value || ''});
+        await loadEventContext(); state.currentView = 'eventos'; renderAll(); showToast('Estado del evento actualizado.', 'success');
+      } catch (err) { showToast(err.message, 'danger'); }
+      finally { mainEl.querySelectorAll('[data-event-state]').forEach(el => { el.disabled = false; }); }
+    }));
+    mainEl.querySelector('#event-create-form')?.addEventListener('submit', async ev => {
+      ev.preventDefault(); try { const event = await API.post('/eventos/', {sede: Number(state.sedeId), nombre: mainEl.querySelector('#event-name').value.trim(), fecha_inicio: mainEl.querySelector('#event-start').value, fecha_fin: mainEl.querySelector('#event-end').value, lugar: mainEl.querySelector('#event-place').value.trim()});
+        state.eventoId = event.id; await loadEventContext(); await changeEvent(event.id); showToast('Evento creado como borrador.', 'success');
+      } catch (err) { showToast(err.message, 'danger'); }
+    });
+    mainEl.querySelector('#sede-create-form')?.addEventListener('submit', async ev => {
+      ev.preventDefault(); try { const sede = await API.post('/sedes/', {nombre: mainEl.querySelector('#sede-name').value.trim(), codigo: mainEl.querySelector('#sede-code').value.trim(), direccion: mainEl.querySelector('#sede-address').value.trim()});
+        await loadEventContext(); state.sedeId = sede.id; state.currentView = 'eventos'; await changeEvent(''); showToast('Sede registrada. Ahora puedes crear su primera jornada.', 'success');
+      } catch (err) { showToast(err.message, 'danger'); }
+    });
+    if (docente) {
+      const picker = mainEl.querySelector('#sede-operator');
+      API.get('/sedes/operadores/').then(rows => {
+        picker.innerHTML = rows.map(p => `<option value="${p.id}">${esc(p.nombre)} · ${esc(p.rol)}</option>`).join('');
+      }).catch(err => showToast(err.message, 'danger'));
+      mainEl.querySelector('#sede-operator-form').addEventListener('submit', async ev => {
+        ev.preventDefault(); try { await API.post('/sedes/operadores/', {sede: state.sedeId, usuario: picker.value});
+          showToast('Operador habilitado en esta sede.', 'success');
+        } catch (err) { showToast(err.message, 'danger'); }
+      });
+    }
+  }
+
+
+  function localDateTime(value) {
+    if (!value) return '';
+    const d = new Date(value);
+    return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0,16);
+  }
+
+  function renderJornadasScreen() {
+    const event = activeEvent();
+    if (!event) { mainEl.innerHTML = '<div class="card">Selecciona un evento para planificar sus días.</div>'; return; }
+    const docente = state.auth.rol === 'DOCENTE_PO';
+    const editable = docente && event.estado !== 'Finalizado';
+    const days = state.days || [];
+    mainEl.innerHTML = `<div class="card"><h2>Días y participantes · ${esc(event.nombre)}</h2>
+      <p>El cierre habitual es a las 18:00. El docente puede ajustar el horario de cada día. Iniciar el evento habilita la apertura de sus jornadas; abrir y cerrar cada día son acciones independientes.</p>
+      <p>Los participantes indican quién está previsto para ese día. Conservan su rol y permisos habituales; esta lista no registra asistencia ni calificaciones.</p></div>
+      ${docente ? `<div class="card"><h3>Inscripción y continuidad</h3><form id="daily-options" class="form-grid">
+        <label>Apertura de inscripción (opcional)<input name="inscripcion_desde" type="datetime-local" value="${localDateTime(event.inscripcion_desde)}"></label>
+        <label>Cierre de inscripción (opcional)<input name="inscripcion_hasta" type="datetime-local" value="${localDateTime(event.inscripcion_hasta)}"></label>
+        <label class="form-full checkbox-tile"><input name="permite_continuidad" type="checkbox" ${event.permite_continuidad ? 'checked' : ''}>Permitir excepcionalmente continuar trabajos otro día del mismo evento</label>
+        <p class="form-full">No implica retener equipos automáticamente. Cada caso necesita autorización del docente y del titular, lugar y responsable de resguardo.</p>
+        <button class="btn btn-primary" type="submit" ${!editable ? 'disabled' : ''}>Guardar opciones</button></form></div>` : ''}
+      ${days.map(j => `<article class="card daily-card"><h3>${esc(j.fecha)} · <span class="status-pill">${esc(j.estado)}</span></h3>
+        <p>Atención: ${esc(j.apertura.slice(0,5))} a ${esc(j.cierre.slice(0,5))} · Recepción hasta ${esc(j.limite_recepcion.slice(0,5))}</p>
+        ${editable && j.estado !== 'Cerrada' ? `<form data-day-hours="${j.id}" class="form-grid"><label>Apertura<input name="apertura" type="time" value="${j.apertura.slice(0,5)}" required></label><label>Cierre<input name="cierre" type="time" value="${j.cierre.slice(0,5)}" required></label><label>Recepción hasta<input name="limite_recepcion" type="time" value="${j.limite_recepcion.slice(0,5)}" required></label><label>Motivo del ajuste<input name="motivo" maxlength="500" ${j.estado === 'Abierta' ? 'required' : ''}></label><button class="btn btn-outline" type="submit">Guardar horario</button></form>` : ''}
+        <h4>Participantes previstos</h4><ul>${j.participantes.map(p => `<li>${esc(p.nombre)} · ${esc(p.rol)} ${editable && j.estado !== 'Cerrada' ? `<button type="button" class="btn btn-ghost btn-sm" data-day-remove="${j.id}" data-operator="${p.id}">Quitar</button>` : ''}</li>`).join('') || '<li>Sin participantes asignados.</li>'}</ul>
+        ${editable && j.estado !== 'Cerrada' ? `<form data-day-staff="${j.id}" class="form-grid"><label>Operador de esta sede<select name="operador" required><option value="">Selecciona un operador</option>${(state.operators || []).filter(p => (p.sedes || []).map(String).includes(String(event.sede))).map(p => `<option value="${p.id}">${esc(p.nombre)} · ${esc(p.rol)}</option>`).join('')}</select></label><div><button type="submit" class="btn btn-outline">Agregar participante</button></div></form>` : ''}
+        ${editable && event.estado === 'En curso' ? `<form data-day-state="${j.id}" class="form-grid"><input type="hidden" name="estado" value="${j.estado === 'Abierta' ? 'Cerrada' : 'Abierta'}">${['Cerrada','No realizada'].includes(j.estado) ? '<label>Motivo de reapertura<input name="motivo" required maxlength="500"></label>' : ''}<div><button type="submit" class="btn btn-primary">${j.estado === 'Abierta' ? 'Cerrar día' : j.estado === 'Pendiente' ? 'Abrir día' : 'Reabrir día'}</button></div></form>` : ''}
+      </article>`).join('')}
+      ${state.dailyMetrics ? `<div class="card"><h3>Resumen diario</h3><p>${state.dailyMetrics.equipos_unicos} equipos únicos atendidos en el evento. Un equipo que continúa al día siguiente no cuenta como una nueva recepción.</p>${state.dailyMetrics.sin_jornada_registrada ? `<p>${state.dailyMetrics.sin_jornada_registrada} fichas anteriores no tienen día de recepción registrado; se conservan sin inventar fechas.</p>` : ''}<div style="overflow-x:auto"><table class="daily-summary"><thead><tr><th>Día</th><th>Equipos recibidos</th><th>Certificados</th><th>Entregados</th></tr></thead><tbody>${state.dailyMetrics.dias.map(d => `<tr><td>${esc(d.fecha)}</td><td>${d.equipos_recibidos}</td><td>${d.terminados}</td><td>${d.entregados}</td></tr>`).join('')}</tbody></table></div></div>` : ''}`;
+    const submit = (selector, path, method = 'post', transform = x => x) => {
+      mainEl.querySelectorAll(selector).forEach(form => form.addEventListener('submit', async ev => {
+        ev.preventDefault(); const button = form.querySelector('button[type="submit"]'); button.disabled = true;
+        try { await API[method](path(form), transform(Object.fromEntries(new FormData(form)),form)); await loadEventContext(); await navigate('jornadas'); showToast('Planificación actualizada.', 'success'); }
+        catch (err) { showToast(err.message, 'danger'); button.disabled = false; }
+      }));
+    };
+    submit('#daily-options', () => `/eventos/${event.id}/opciones/`, 'put', (d,form) => ({permite_continuidad: form.elements.permite_continuidad.checked, inscripcion_desde:d.inscripcion_desde ? new Date(d.inscripcion_desde).toISOString() : null, inscripcion_hasta:d.inscripcion_hasta ? new Date(d.inscripcion_hasta).toISOString() : null}));
+    submit('[data-day-hours]', f => `/jornadas/${f.dataset.dayHours}/horario/`, 'put');
+    submit('[data-day-state]', f => `/jornadas/${f.dataset.dayState}/estado/`);
+    submit('[data-day-staff]', f => `/jornadas/${f.dataset.dayStaff}/participantes/`);
+    mainEl.querySelectorAll('[data-day-remove]').forEach(b => b.addEventListener('click', async () => { try { await API.post(`/jornadas/${b.dataset.dayRemove}/participantes/`, {operador:b.dataset.operator,accion:'quitar'}); await navigate('jornadas'); } catch (err) { showToast(err.message, 'danger'); } }));
+  }
+
+  function renderContinuityActions() {
+    const f = state.activeFicha;
+    if (!f || !['taller','custodia','incidencias'].includes(state.currentView)) return;
+    const doc = state.auth.rol === 'DOCENTE_PO';
+    const hold = f.resguardo_activo;
+    if (hold) {
+      mainEl.querySelectorAll('form input, form select, form textarea, form button').forEach(el => { el.disabled = true; });
+      mainEl.insertAdjacentHTML('afterbegin', `<div class="card"><h3>Equipo en resguardo entre jornadas</h3><p>Retorno previsto: ${esc(hold.fecha)} · ${esc(hold.lugar)} · Responsable: ${esc(hold.responsable)}. El docente debe registrar su retorno antes de continuar el taller.</p>${doc ? '<button type="button" class="btn btn-primary" id="daily-return">Registrar retorno del equipo</button>' : ''}</div>`);
+      mainEl.querySelector('#daily-return')?.addEventListener('click', async () => { try { await API.post(`/fichas/${f.numero_ticket}/retorno-resguardo/`,{}); await navigate(state.currentView); showToast('Retorno registrado. Se conserva el avance.', 'success'); } catch (err) { showToast(err.message,'danger'); } });
+      return;
+    }
+    if (activeEvent()?.estado === 'Finalizado' || !['Recibido','En proceso','En espera'].includes(f.estado)) return;
+    if (state.currentView === 'taller' && ['TECNICO','DOCENTE_PO'].includes(state.auth.rol)) {
+      mainEl.insertAdjacentHTML('beforeend', `<div class="card"><h3>Solicitar derivación a un especialista</h3><p>El equipo queda en espera para coordinación del docente. Esta solicitud no registra una entrega física.</p><form id="daily-referral" class="form-grid"><label>Especialista o servicio sugerido<input name="destino" maxlength="160" required></label><label>Motivo<textarea name="motivo" maxlength="2000" required></textarea></label><button type="submit" class="btn btn-outline">Solicitar derivación</button></form></div>`);
+      mainEl.querySelector('#daily-referral').addEventListener('submit', async ev => { ev.preventDefault(); try { await API.post(`/fichas/${f.numero_ticket}/derivar/`,Object.fromEntries(new FormData(ev.target))); await navigate('incidencias'); showToast('Derivación registrada. Debe coordinarla el docente.', 'success'); } catch(err) { showToast(err.message,'danger'); } });
+    }
+    if (doc && state.currentView === 'custodia' && activeEvent()?.permite_continuidad) {
+      const days = activeEvent().jornadas || [];
+      const current = days.find(j => j.estado === 'Abierta');
+      const next = days.filter(j => j.estado === 'Pendiente' && current && j.fecha > current.fecha);
+      mainEl.insertAdjacentHTML('afterbegin', `<div class="card"><h3>Continuar el trabajo otro día (excepcional)</h3><p>Se mantiene el mismo ticket y checklist. No utilizar para equipos que solo esperan retiro.</p>${next.length ? `<form id="daily-hold" class="form-grid"><label>Día de retorno<select name="hasta">${next.map(j => `<option value="${j.id}">${esc(j.fecha)}</option>`).join('')}</select></label><label>Lugar de resguardo<input name="lugar" required maxlength="200"></label><label>Responsable<input name="responsable" required maxlength="160"></label><label>Motivo<textarea name="motivo" required maxlength="2000"></textarea></label><label class="form-full checkbox-tile"><input name="titular_autoriza" type="checkbox" required>El titular autorizó dejar el equipo y fue informado del día de retorno</label><button type="submit" class="btn btn-primary">Autorizar resguardo como docente</button></form>` : '<p>Requiere un día abierto y una jornada posterior pendiente del mismo evento.</p>'}</div>`);
+      mainEl.querySelector('#daily-hold')?.addEventListener('submit', async ev => { ev.preventDefault(); try { const data=Object.fromEntries(new FormData(ev.target)); data.titular_autoriza=ev.target.elements.titular_autoriza.checked; await API.post(`/fichas/${f.numero_ticket}/resguardo-diario/`,data); await navigate('custodia'); showToast('Resguardo autorizado.', 'success'); } catch(err) { showToast(err.message,'danger'); } });
+    }
+  }
+
   async function fetchMetricas() {
     try {
       state.metricasData = await timedApi(() => API.get('/metricas/'));
@@ -2579,9 +2840,14 @@
 
   mainEl.addEventListener('click', ev => {
     const stBtn = ev.target.closest('[data-step-goto]');
-    if (stBtn && !stBtn.disabled) {
-      navigate(stBtn.getAttribute('data-step-goto'));
+    if (!stBtn) return;
+    const view = stBtn.getAttribute('data-step-goto');
+    if (!hasRole(view)) {
+      const roles = (VIEW_ROLES[view] || []).map(roleShortLabel).join(' o ');
+      showToast(`No tienes permisos para abrir ${stBtn.textContent.trim()}. Disponible para ${roles}.`, 'warning');
+      return;
     }
+    navigate(view);
   });
 
   ticketSelectEl.addEventListener('change', async () => {
@@ -2594,12 +2860,21 @@
   btnScenarios.addEventListener('click', openScenariosModal);
 
   btnLogout.addEventListener('click', async () => {
+    if (btnLogout.disabled) return;
+    btnLogout.disabled = true;
     try {
       await timedApi(() => API.post('/auth/logout/', {}));
+      state.auth = { authenticated: false, rol: 'PUBLIC' };
+      state.currentView = 'qr'; state.fichasList = []; state.activeFicha = null;
+      state.activeTicketNumber = ''; state.qrPrefill = null; state.lookupResult = null;
+      state.days = []; state.operators = []; state.dailyMetrics = null;
+      renderAll();
       showToast('Sesión cerrada.', 'info');
       await refreshSession(false);
     } catch (err) {
       showToast(err.message, 'danger');
+    } finally {
+      btnLogout.disabled = false;
     }
   });
 

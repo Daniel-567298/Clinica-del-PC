@@ -1,6 +1,7 @@
 'use strict';
 
 window.ClinicaAPI = (() => {
+  let eventoId = null;
   // Si el frontend corre desacoplado en Live Server (:5500), apunta al backend Django (:8000);
   // si es servido por el mismo origen, usa ruta relativa.
   const API_BASE =
@@ -29,7 +30,7 @@ window.ClinicaAPI = (() => {
   }
 
   async function request(path, { method = 'GET', body = null, isFormData = false } = {}) {
-    const headers = {};
+    const headers = eventoId ? { 'X-Clinica-Evento': String(eventoId) } : {};
     if (method !== 'GET' && method !== 'HEAD') {
       headers['X-CSRFToken'] = await ensureCsrf();
     }
@@ -68,6 +69,7 @@ window.ClinicaAPI = (() => {
     const res = await fetch(`${API_BASE}${path}`, {
       method: 'GET',
       credentials: 'include',
+      headers: eventoId ? { 'X-Clinica-Evento': String(eventoId) } : {},
     });
     if (!res.ok) {
       let msg = `Error HTTP ${res.status}`;
@@ -89,6 +91,7 @@ window.ClinicaAPI = (() => {
   }
 
   return {
+    setEvento: id => { eventoId = id || null; },
     API_BASE,
     ApiError,
     get: (p) => request(p),

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Clínica del PC — INACAP San Pedro de la Paz</title>
-  <link rel="stylesheet" href="/css/app.css">
+  <link rel="stylesheet" href="/css/app.css?v={{ frontend_versions.styles }}">
 </head>
 <body>
 
@@ -44,6 +44,7 @@
     </div>
   </header>
 
+  <section class="event-context" id="event-context" aria-label="Sede y evento de atención"></section>
   <div class="app-shell is-public" id="app-shell">
     <nav class="side-nav" id="side-navigation" aria-label="Menú operativo"></nav>
     <main class="main-view" id="main-content"></main>
@@ -60,8 +61,8 @@
     <div class="modal-box" id="app-modal-content"></div>
   </div>
 
-  <script src="/js/validators.js" defer></script>
-  <script src="/js/api.js" defer></script>
-  <script src="/js/app.js" defer></script>
+  <script src="/js/validators.js?v={{ frontend_versions.validators }}" defer></script>
+  <script src="/js/api.js?v={{ frontend_versions.api }}" defer></script>
+  <script src="/js/app.js?v={{ frontend_versions.app }}" defer></script>
 </body>
 </html>

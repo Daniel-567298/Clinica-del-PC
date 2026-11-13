@@ -1,101 +1,176 @@
-# Sistema de Gestión: Clínica del PC — Prototipo Profesional (Django + DRF + PostgreSQL 17)
+# Clínica del PC — INACAP
 
-**Asignatura:** Ingeniería de Software (`TI3043`) — Evaluación Sumativa N° 3  
-**Sede:** INACAP San Pedro de la Paz  
-**Docente / Product Owner:** Prof. Pablo E. Pesce Sánchez  
-**Equipo:** Daniel Melimán & Diego Astudillo  
+Sistema académico para gestionar preinscripciones, recepción, checklist de taller, bitácora, calidad, entrega y encuesta. Organiza distintas ediciones por sede y año, con uno o varios días de atención.
 
----
+**Asignatura:** Ingeniería de Software TI3043 · Evaluación Sumativa N.º 3
 
-## 1. Arquitectura y Decisiones Técnicas
+**Sede de referencia:** San Pedro de la Paz
 
-- **Backend:** Django 6.1 + Django REST Framework (DRF) bajo arquitectura API REST + RBAC estricta (`IsAuthenticated` por defecto).
-- **Base de Datos:** **PostgreSQL 17** relacional normalizada (`psycopg[binary]`, 11 tablas en `clinica/models.py`).
-  - **Cero SQLite:** No existe fallback a SQLite.
-  - **Cero archivos `.json`:** Toda la configuración, catálogo, plantillas, bitácoras WORM, auditoría OWASP y nóminas residen en PostgreSQL (exportaciones únicamente en `.csv` sanitizado contra CSV Injection).
-- **Frontend Desacoplado (`frontend/`):** HTML5 + CSS3 + JavaScript ES6 puro con arquitectura orientada a componentes API (`validators.js`, `api.js`, `app.js`), CSP estricta (`script-src 'self'`, cero scripts o eventos inline).
-- **Patrones GoF Implementados en Python (`backend/clinica/patterns/`):**
-  1. **State (`TicketStateMachine`):** Gobierna transiciones estrictas de `FichaAtencion` e impone compuertas `CA07`, `CA08` y bloqueo legal `Ley 21.459`.
-  2. **Factory (`FichaAndChecklistFactory`):** Genera correlativos (`PC-XXX`, `DEV-XX`, `CL-XX`) y materializa ítems de checklist multi-servicio con clave única `Servicio::orden`.
-  3. **Observer (`ClinicEventBus`):** Bus de eventos interno que persiste automáticamente trazabilidad WORM en `EventoSeguridadOWASP` (OWASP A09).
-  4. **Repository + Singleton (`ClinicaRepository`):** Encapsula consultas optimizadas con `select_related`/`prefetch_related` y mide cumplimiento de latencia `RNF07 <= 2.0 s`.
-- **Seguridad OWASP Top 10:2025 y Cumplimiento Legal Chileno:**
-  - **A01 Control de Acceso:** RBAC por perfil (`RECEPCIONISTA`, `TECNICO`, `DOCENTE_PO`), consulta pública anti-IDOR (Ticket + RUT coincidente) y proyección server-side **Ley N° 21.719** (el rol `TECNICO` nunca recibe RUT real, apellidos, teléfono, correo ni dirección en HTTP JSON).
-  - **A04 / A07 Autenticación:** Django `SessionAuthentication` (`HttpOnly`, `SameSite=Lax`, CSRF), hashes PBKDF2 y bloqueo temporal tras 5 intentos fallidos (`HTTP 429`).
-  - **A05 / A08 Integridad:** Sanitización anti-CSV Injection (`= + - @`), hash `SHA-256` server-side de consentimiento digital (**Ley N° 19.799**), registros WORM inmutables (`BitacoraNota`, `TransicionEstadoLog`, `EventoSeguridadOWASP`) y purga/anonimización tras 60 días de custodia.
-  - **Ley N° 21.459:** Bloqueo inmediato (`HTTP 423 Locked`) ante hallazgo presuntamente ilícito hasta resolución del Docente PO.
+**Docente / Product Owner:** Pablo E. Pesce Sánchez
 
----
+**Equipo:** Daniel Melimán y Diego Astudillo
 
-## 2. Estructura del Proyecto
+## Estado y arquitectura
+
+Prototipo funcional de frontend y backend para desarrollo y evaluación; no es un despliegue de producción ni una certificación de cumplimiento legal o de seguridad. El alcance definitivo de la entrega académica debe acordarse con el docente.
+
+- Frontend: HTML, CSS y JavaScript, servido por Django.
+- Backend: Django y Django REST Framework; versiones en [requirements.txt](backend/requirements.txt).
+- Base de datos: PostgreSQL 17. No utiliza SQLite.
+- Patrones: State, Factory, Observer y Repository con Singleton.
+- Validación: **45 pruebas automatizadas** sobre PostgreSQL.
+
+## Funcionalidades
+
+| Área | Comportamiento |
+| --- | --- |
+| Inscripción | Un formulario por equipo, RUT validado y día preferido. No sobrescribe los datos de un propietario existente. |
+| Recepción | Búsqueda por ticket o RUT, inspección, consentimiento y día efectivo de ingreso. |
+| Taller | Checklist por servicio y sede, autor, fecha, bitácora e incidencias. |
+| Privacidad | Permisos por rol y sede; contactos y notas privadas de mesón ocultos al técnico. |
+| Entrega | Constancia obligatoria de prueba conjunta; devolución sin reparación con observaciones cuando corresponda. |
+| Encuesta | Valoración validada; entradas inválidas reciben un error de validación. |
+| Eventos y sedes | Historial por año y separación de fichas, plantillas, métricas y auditoría por sede. |
+| Jornadas | Horarios por día, cierre propuesto a las 18:00, participantes y apertura/cierre manual del docente. |
+| Continuidad | Resguardo excepcional autorizado entre días; conserva ticket y checklist. Deshabilitado inicialmente. |
+| Derivación | Solicitud a especialista; equipo en espera para coordinación del docente. |
+| Historial | Retiros posteriores al evento y copia de configuración para otra edición sin copiar fichas ni participantes. |
+
+## Estructura
 
 ```text
-Clinica-del-PC/
-├── backend/
-│   ├── config/                # settings.py (PostgreSQL-only), urls.py
-│   ├── clinica/
-│   │   ├── models.py          # 11 tablas relacionales normalizadas + WORM
-│   │   ├── patterns/          # State, Factory, Observer, Repository + Singleton
-│   │   ├── security/          # RBAC, DTO privacidad Ley 21.719, Módulo 11, CSV, CSP, A10
-│   │   ├── management/commands/seed_clinica.py
-│   │   ├── migrations/
-│   │   ├── serializers.py
-│   │   ├── views.py
-│   │   ├── urls.py
-│   │   └── tests.py           # Suite PostgreSQL (GoF, RBAC, IDOR, A07, A05, 21.719/21.459)
-│   ├── .env.example
-│   ├── manage.py
-│   └── requirements.txt
-└── frontend/
-    ├── index.html
-    ├── css/app.css
-    └── js/{validators.js, api.js, app.js}
+backend/
+  config/          Configuración, rutas y versiones de archivos del frontend
+  clinica/
+    models.py      Atención, sedes, eventos y jornadas
+    jornadas.py    Operación diaria y continuidad
+    migrations/    Evolución del esquema y conservación de datos anteriores
+    patterns/      State, Factory, Observer y Repository
+    security/      Roles, contexto de sede/evento y privacidad
+    tests*.py      Pruebas de atención, jornadas y sesión
+  .env.example
+  manage.py
+  requirements.txt
+frontend/          Interfaz conectada a la API
+docs/              Guías de sedes, jornadas e inicio de sesión
 ```
 
----
+## Instalación local en Windows
 
-## 3. Requisitos e Instalación (PostgreSQL 17 + Windows)
-
-1. **Instalar PostgreSQL 17** en Windows (por ejemplo vía `winget install PostgreSQL.PostgreSQL.17` o instalador oficial EDB) y asegurarse de que el servicio `postgresql-x64-17` esté en ejecución en `127.0.0.1:5432`.
-2. **Crear la base de datos en PostgreSQL (`psql`):**
-   ```sql
-   CREATE DATABASE clinica_del_pc WITH ENCODING 'UTF8';
-   ```
-3. **Instalar dependencias Python:**
-   ```powershell
-   cd backend
-   pip install -r requirements.txt
-   ```
-4. **Configurar variables de entorno (`backend/.env`):**
-   Copiar `.env.example` a `.env` y completar `DB_PASSWORD` con la clave de tu usuario `postgres` y una `DJANGO_SECRET_KEY` segura.
-5. **Aplicar migraciones y poblar datos iniciales en PostgreSQL:**
-   ```powershell
-   python manage.py migrate
-   python manage.py seed_clinica
-   ```
-6. **Ejecutar servidor:**
-   ```powershell
-   python manage.py runserver
-   ```
-   Abrir en el navegador: `http://127.0.0.1:8000/` (también soporta Live Server en `:5500` vía CORS configurado).
-
----
-
-## 4. Cuentas Demo Sembradas (`seed_clinica`)
-
-| Rol | Usuario | Correo | Contraseña Demo |
-| :--- | :--- | :--- | :--- |
-| **Recepcionista** | `daniel.meliman` | `daniel.meliman@inacapmail.cl` | `ClinicaPC!26` |
-| **Recepcionista (Mesón)** | `recepcion` | `recepcion@inacap.cl` | `ClinicaPC!26` |
-| **Alumno Técnico** | `diego.astudillo` | `diego.astudillo@inacapmail.cl` | `TallerPC!26` |
-| **Docente / PO** | `pablo.pesce` | `pablo.pesce@inacap.cl` | `DocentePO!26` |
-
----
-
-## 5. Ejecución de Pruebas Automatizadas (PostgreSQL)
+Requisitos: Git, **Python 3.12** (versión usada en la validación) y **PostgreSQL 17** en ejecución. Comandos para PowerShell:
 
 ```powershell
-cd backend
-python manage.py test clinica --verbosity 2
+git clone https://github.com/Daniel-567298/Clinica-del-PC.git
+cd Clinica-del-PC
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+Copy-Item backend/.env.example backend/.env
 ```
-> **Nota:** El usuario PostgreSQL configurado en `.env` debe tener privilegio `CREATEDB` para que Django cree y destruya la base temporal `test_clinica_del_pc` durante las pruebas.
+
+Crear una base vacía desde `psql` o pgAdmin:
+
+```sql
+CREATE DATABASE clinica_del_pc WITH ENCODING 'UTF8';
+```
+
+Editar `backend/.env`: configurar `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST` y `DB_PORT`. El puerto habitual es **5432**; debe coincidir con el de tu instalación. Generar una clave propia para `DJANGO_SECRET_KEY`:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(64))"
+cd backend
+..\.venv\Scripts\python.exe manage.py migrate
+```
+
+No subir `.env`, credenciales reales ni copias de bases de datos al repositorio.
+
+### Demostración con datos ficticios
+
+Solo en una instalación de prueba, desde `backend`:
+
+```powershell
+..\.venv\Scripts\python.exe manage.py seed_clinica
+..\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
+```
+
+Abrir **http://127.0.0.1:8000/**. Aparece **San Pedro de la Paz → Jornada inicial de demostración**, con cinco fichas de ejemplo. Se ingresa desde **Iniciar sesión**; no es necesario utilizar Casos de prueba.
+
+| Perfil | Usuario | Contraseña de demostración |
+| --- | --- | --- |
+| Recepción | `daniel.meliman` o `recepcion` | `ClinicaPC!26` |
+| Técnico | `diego.astudillo` | `TallerPC!26` |
+| Docente / administración central | `pablo.pesce` | `DocentePO!26` |
+
+Credenciales públicas exclusivas de la demo. El docente demo es superusuario y ve todas las sedes. La carga demo modifica cuentas de prueba: no ejecutarla sobre datos reales ni como procedimiento de actualización.
+
+### Instalación vacía para otra sede
+
+Después de migrar, omitir `seed_clinica`:
+
+```powershell
+..\.venv\Scripts\python.exe manage.py createsuperuser
+..\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000
+```
+
+1. Ingresar con el superusuario y registrar la sede en **Eventos y sedes**.
+2. Crear cuentas y perfiles en **/admin/**; asignar rol, sedes y habilitación.
+3. Cargar servicios y plantillas en Administración Django. Personalizar las tareas por sede desde **Plantillas y Nómina** cuando exista el catálogo.
+4. Crear un evento y configurar sus días y horarios en **Días y participantes**.
+5. Abrir inscripciones, iniciar el evento y abrir el primer día antes de recibir equipos.
+
+Una instancia puede atender varias sedes con permisos separados. Las instalaciones con bases independientes no sincronizan sus datos entre sí.
+
+## Uso de eventos y jornadas
+
+El selector superior indica la sede y edición actuales. **Eventos y sedes** permite consultar años anteriores y crear una nueva edición en borrador.
+
+Los horarios son planificación: **no cierran automáticamente el sistema por reloj**. El docente abre y cierra cada día; modificar el horario de un día abierto exige motivo. El cierre se bloquea si quedan equipos recibidos sin entrega o resguardo documentados.
+
+Los participantes son operadores previstos para el día; la lista no cambia sus permisos ni registra asistencia o calificaciones. No existen cupos obligatorios de inscripción.
+
+La continuidad requiere habilitarla en el evento y autorizar cada caso: titular, docente, lugar, responsable y día de retorno. Durante el resguardo se bloquea el taller hasta registrar el retorno. Se conservan el ticket y los avances del checklist.
+
+Al finalizar, el taller queda en consulta; **Aviso de Retiro** y **Entrega y Encuesta** permiten retiros posteriores. Reabrir exige motivo. Detalles en [Eventos y sedes](docs/EVENTOS_Y_SEDES.md) y [Jornadas y continuidad](docs/JORNADAS_Y_CONTINUIDAD.md).
+
+## Actualizar una instalación existente
+
+Respaldar previamente la base con herramientas de PostgreSQL y conservar el `.env`. En una copia sin modificaciones pendientes:
+
+```powershell
+git pull --ff-only
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+cd backend
+..\.venv\Scripts\python.exe manage.py migrate
+```
+
+Reiniciar el servidor y recargar con **Ctrl + F5**. No repetir la carga demo. Las migraciones asocian fichas anteriores a la sede y evento iniciales conservando sus tickets; no inventan días de recepción para registros históricos sin ese dato.
+
+## Pruebas
+
+Desde `backend`, con PostgreSQL disponible:
+
+```powershell
+..\.venv\Scripts\python.exe manage.py check
+..\.venv\Scripts\python.exe manage.py makemigrations --check --dry-run
+..\.venv\Scripts\python.exe manage.py test clinica --verbosity 2
+```
+
+El usuario PostgreSQL necesita `CREATEDB` para crear y retirar la base temporal. Las 45 pruebas cubren privacidad, entrega, encuesta, permisos, sedes, eventos, jornadas, continuidad, copia anual, archivos y sesión con CSRF.
+
+## Solución de problemas
+
+- **PostgreSQL sin conexión:** revisar servicio, base, usuario, contraseña y puerto del `.env`.
+- **Sedes vacías o interfaz antigua:** abrir el servidor Django y recargar con Ctrl + F5. Los archivos llevan versión según su contenido; un fallo de catálogo muestra **Reintentar carga**. Ver [Inicio y sesión](docs/INICIO_Y_SESION.md).
+- **Recepción bloqueada:** verificar evento en curso y día abierto por el docente.
+- **Sin eventos públicos:** revisar estado y fechas opcionales de inscripción.
+- **Operador sin acceso:** revisar perfil habilitado y sedes asignadas.
+
+El inicio recomendado es Django en el puerto 8000. Abrir `index.html` directamente no proporciona una API ni una sesión funcionales.
+
+## Límites del prototipo
+
+- Correo y WhatsApp registran acciones o estados; no existe una integración validada de envío real. `correo_enviado` no acredita recepción del mensaje.
+- Consentimientos y autorizaciones son constancias del prototipo, sin integración certificada de firma electrónica.
+- La política existente de custodia y anonimización debe validarse con la institución antes de usar datos reales; los plazos mostrados no constituyen asesoría legal.
+- El CSV de métricas es una exportación, no un respaldo recuperable de toda la base.
+- Faltan validación de carga/concurrencia y revisión de correlativos ante inscripciones simultáneas. Las pruebas funcionales no sustituyen esas verificaciones.
+- Antes de producción se requieren alojamiento adecuado, HTTPS, correo, recuperación de respaldos y políticas institucionales de acceso y tratamiento de datos. El servidor de desarrollo no es un servicio de producción.

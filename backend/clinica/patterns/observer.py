@@ -49,7 +49,21 @@ class ClinicEventBus:
         self._bootstrapped = True
 
         def persist_security_audit(event_type: str, payload: dict):
-            from clinica.models import EventoSeguridadOWASP
+            from clinica.models import EventoSeguridadOWASP, EventoClinica
+            from clinica.security.eventos import current_request, sedes_permitidas
+            sede_id = payload.get("sede_id")
+            request = current_request.get()
+            if sede_id is None and request is not None:
+                event_id = request.headers.get("X-Clinica-Evento") or request.GET.get("evento")
+                if event_id:
+                    try:
+                        sede_id = EventoClinica.objects.filter(pk=int(event_id)).values_list("sede_id", flat=True).first()
+                    except (ValueError, TypeError):
+                        pass
+                elif getattr(request, "user", None) is not None:
+                    candidates = list(sedes_permitidas(request.user).values_list("id", flat=True)[:2])
+                    if len(candidates) == 1:
+                        sede_id = candidates[0]
 
             nivel = payload.get("nivel") or (
                 "CRITICAL"
@@ -57,6 +71,7 @@ class ClinicEventBus:
                 else ("WARN" if "403" in event_type or "FAIL" in event_type or "CSV" in event_type else "INFO")
             )
             EventoSeguridadOWASP.objects.create(
+                sede_id=sede_id,
                 nivel=nivel,
                 evento=event_type[:60],
                 usuario=payload.get("usuario"),

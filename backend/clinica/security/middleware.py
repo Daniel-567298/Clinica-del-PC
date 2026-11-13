@@ -7,7 +7,12 @@ class OwaspSecurityHeadersMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        response = self.get_response(request)
+        from clinica.security.eventos import current_request
+        token = current_request.set(request)
+        try:
+            response = self.get_response(request)
+        finally:
+            current_request.reset(token)
         if not request.path.startswith("/admin"):
             response.setdefault(
                 "Content-Security-Policy",

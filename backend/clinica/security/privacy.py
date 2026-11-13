@@ -1,7 +1,25 @@
 # -*- coding: utf-8 -*-
 """Aislamiento de privacidad de PII conforme a Ley N° 21.719 (Proyección de DTO por rol)."""
 
+import re
 from clinica.security.validators import normalize_rut
+
+
+def redact_note_for_technician(text, ficha):
+    """Protege también los datos copiados a notas técnicas históricas."""
+    text = str(text or "")
+    owner = ficha.propietario
+    for value in (owner.correo, owner.comuna_direccion):
+        if value and len(value.strip()) >= 4:
+            text = re.sub(re.escape(value), "[Dato protegido]", text, flags=re.I)
+    for value in (owner.telefono, owner.rut, ficha.tercero_rut):
+        compact = re.sub(r"[^0-9kK]", "", value or "")
+        if value == owner.telefono and compact.startswith("56") and len(compact) == 11:
+            compact = compact[2:]
+        if len(compact) >= 7:
+            pattern = r"(?<!\w)" + r"[\s().+\-]*".join(map(re.escape, compact)) + r"(?!\w)"
+            text = re.sub(pattern, "[Dato protegido]", text, flags=re.I)
+    return text
 
 
 def mask_rut(rut: str) -> str:

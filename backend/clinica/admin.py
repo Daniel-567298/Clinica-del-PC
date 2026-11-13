@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 from django.contrib import admin
+from clinica.models import Sede, EventoClinica
+admin.site.register(Sede)
+admin.site.register(EventoClinica)
 
 from clinica.models import (
     BitacoraNota,
@@ -42,6 +45,7 @@ class PlantillaTareaAdmin(admin.ModelAdmin):
 
 @admin.register(PerfilOperador)
 class PerfilOperadorAdmin(admin.ModelAdmin):
+    filter_horizontal = ("sedes",)
     list_display = ("user", "rol", "rut", "seccion", "habilitado_jornada", "intentos_fallidos", "bloqueado_hasta")
     list_filter = ("rol", "habilitado_jornada", "seccion")
 

@@ -2,8 +2,23 @@
 from django.urls import path
 
 from clinica import views
+from clinica import jornadas
 
 urlpatterns = [
+    path('eventos/<int:evento_id>/jornadas/', jornadas.JornadasView.as_view()),
+    path('eventos/<int:evento_id>/copiar/', jornadas.CopiarEventoView.as_view()),
+    path('eventos/<int:evento_id>/metricas-diarias/', jornadas.MetricasDiariasView.as_view()),
+    path('eventos/<int:evento_id>/opciones/', jornadas.OpcionesEventoView.as_view()),
+    path('jornadas/<int:jornada_id>/horario/', jornadas.ConfigJornadaView.as_view()),
+    path('jornadas/<int:jornada_id>/estado/', jornadas.EstadoJornadaView.as_view()),
+    path('jornadas/<int:jornada_id>/participantes/', jornadas.ParticipantesJornadaView.as_view()),
+    path('fichas/<str:numero_ticket>/resguardo-diario/', jornadas.ResguardoView.as_view()),
+    path('fichas/<str:numero_ticket>/retorno-resguardo/', jornadas.ReanudarResguardoView.as_view()),
+    path('fichas/<str:numero_ticket>/derivar/', jornadas.DerivarEspecialistaView.as_view()),
+    path("sedes/", views.SedesView.as_view(), name="sedes"),
+    path("sedes/operadores/", views.OperadoresSedeView.as_view(), name="sede-operadores"),
+    path("eventos/", views.EventosView.as_view(), name="eventos"),
+    path("eventos/<int:evento_id>/estado/", views.EstadoEventoView.as_view(), name="evento-estado"),
     path("health/", views.HealthCheckView.as_view(), name="api-health"),
     # Autenticación y sesión OWASP A07
     path("auth/csrf/", views.AuthCSRFView.as_view(), name="auth-csrf"),

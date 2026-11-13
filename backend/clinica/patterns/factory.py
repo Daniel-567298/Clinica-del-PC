@@ -7,12 +7,14 @@ con claves únicas compuestas (`Servicio::orden`) evitando colisiones multi-serv
 
 import re
 from django.db import transaction
+from clinica.patterns.plantillas import plantillas_para_sede
 
 from clinica.models import (
     BitacoraNota,
     ChecklistItemEjecucion,
     Dispositivo,
     FichaAtencion,
+    EventoClinica,
     PlantillaTarea,
     Propietario,
     ServicioCatalogo,
@@ -76,9 +78,7 @@ class FichaAndChecklistFactory:
         created_or_kept = []
 
         for srv in services:
-            plantillas = list(
-                PlantillaTarea.objects.filter(servicio=srv, version=srv.version_actual).order_by("orden")
-            )
+            plantillas = list(plantillas_para_sede(srv, ficha.evento.sede)[0])
             for idx, tarea in enumerate(plantillas):
                 key = cls.task_unique_key(srv.nombre, idx)
                 if key in existing_map:
@@ -107,7 +107,15 @@ class FichaAndChecklistFactory:
         service_names: list[str],
         actor_name: str = "Propietario QR",
         device_existing: Dispositivo | None = None,
+        evento=None,
     ) -> FichaAtencion:
+        if evento is None:
+            # Compatibilidad de las herramientas internas y seed con una sola jornada.
+            from rest_framework.exceptions import ValidationError
+            candidates = list(EventoClinica.objects.filter(estado__in=["Inscripciones abiertas", "En curso"])[:2])
+            if len(candidates) != 1:
+                raise ValidationError("Seleccione el evento de la atención.")
+            evento = candidates[0]
         if device_existing is None:
             dev = Dispositivo.objects.create(
                 codigo_dispositivo=cls.next_device_code(),
@@ -122,8 +130,9 @@ class FichaAndChecklistFactory:
         if not services:
             services = list(ServicioCatalogo.objects.filter(activo=True)[:1])
 
-        max_ver = max((s.version_actual for s in services), default=1)
+        max_ver = max((plantillas_para_sede(s, evento.sede)[1] for s in services), default=1)
         ficha = FichaAtencion.objects.create(
+            evento=evento,
             numero_ticket=cls.next_ticket_number(),
             propietario=owner,
             dispositivo=dev,

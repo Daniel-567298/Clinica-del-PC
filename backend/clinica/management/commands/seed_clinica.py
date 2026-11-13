@@ -18,6 +18,8 @@ from clinica.models import (
     Dispositivo,
     EventoSeguridadOWASP,
     FichaAtencion,
+    Sede,
+    EventoClinica,
     PerfilOperador,
     PlantillaTarea,
     Propietario,
@@ -34,6 +36,9 @@ class Command(BaseCommand):
 
     @transaction.atomic
     def handle(self, *args, **options):
+        sede, _ = Sede.objects.get_or_create(codigo="san-pedro-de-la-paz", defaults={"nombre": "San Pedro de la Paz"})
+        evento, _ = EventoClinica.objects.get_or_create(sede=sede, nombre="Jornada inicial de demostración",
+            defaults={"fecha_inicio": timezone.localdate(), "fecha_fin": timezone.localdate(), "lugar": "Mesón de atención", "estado": "En curso"})
         self.stdout.write("Poblando catálogo de servicios oficiales y plantillas...")
         catalogo = {
             "Mantención Física": (
@@ -97,6 +102,7 @@ class Command(BaseCommand):
                 user=user,
                 defaults={"rol": rol, "rut": rut, "seccion": sec, "token_temporal_hash": tok_hash, "habilitado_jornada": True},
             )
+            user.perfil.sedes.add(sede)
             users[uname] = user
 
         if FichaAtencion.objects.exists():
@@ -118,7 +124,7 @@ class Command(BaseCommand):
         now = timezone.now()
 
         # PC-024: Camila Device 1 (Recibido, Multi-servicio 2 de 10 tareas completas)
-        f24 = FichaAtencion.objects.create(
+        f24 = FichaAtencion.objects.create(evento=evento,
             numero_ticket="PC-024", propietario=o_camila, dispositivo=d1,
             problema_declarado="Se calienta en exceso y se apaga de golpe a los 10 minutos de uso intensivo.",
             estado="Recibido", prueba_inicial="Enciende normalmente",
@@ -139,7 +145,7 @@ class Command(BaseCommand):
         BitacoraNota.objects.create(ficha=f24, autor=users["diego.astudillo"], autor_nombre="Diego Astudillo (Técnico)", contenido="Apertura de tapa inferior completada. Pasta térmica solidificada.")
 
         # PC-025: Camila Device 2 (Torre Clon CL-01 Preinscrita)
-        f25 = FichaAtencion.objects.create(
+        f25 = FichaAtencion.objects.create(evento=evento,
             numero_ticket="PC-025", propietario=o_camila, dispositivo=d2,
             problema_declarado="No bootea disco principal; arroja pantalla azul WHEA_UNCORRECTABLE_ERROR.",
             estado="Preinscrito", prueba_inicial="Enciende pero no da video",
@@ -153,7 +159,7 @@ class Command(BaseCommand):
         BitacoraNota.objects.create(ficha=f25, autor_nombre="Propietario QR", contenido="Preinscripción registrada vía QR.")
 
         # PC-026: Carlos (En proceso, 100% checklist listo para verificación Paso 6)
-        f26 = FichaAtencion.objects.create(
+        f26 = FichaAtencion.objects.create(evento=evento,
             numero_ticket="PC-026", propietario=o_carlos, dispositivo=d3,
             problema_declarado="Ventilador emite ruido de roce estridente y se traba la bisagra derecha.",
             estado="En proceso", prueba_inicial="No enciende",
@@ -172,7 +178,7 @@ class Command(BaseCommand):
         BitacoraNota.objects.create(ficha=f26, autor_nombre="Daniel Melimán", contenido="Limpieza de ventilador y ajuste de bisagra completado.")
 
         # PC-027: María (Listo para entrega - prueba entrega tercero Paso 8)
-        f27 = FichaAtencion.objects.create(
+        f27 = FichaAtencion.objects.create(evento=evento,
             numero_ticket="PC-027", propietario=o_maria, dispositivo=d4,
             problema_declarado="Inundación de ventanas emergentes y lentitud al abrir navegadores.",
             estado="Listo para entrega", prueba_inicial="Enciende normalmente",
@@ -190,7 +196,7 @@ class Command(BaseCommand):
         BitacoraNota.objects.create(ficha=f27, autor_nombre="Diego Astudillo", contenido="Se eliminaron extensiones maliciosas y adware.")
 
         # PC-028: Jorge (En custodia 18:00 hrs Paso 9)
-        f28 = FichaAtencion.objects.create(
+        f28 = FichaAtencion.objects.create(evento=evento,
             numero_ticket="PC-028", propietario=o_jorge, dispositivo=d5,
             problema_declarado="Mantenimiento preventivo semestral y cambio de pasta.",
             estado="En custodia", prueba_inicial="Enciende normalmente",

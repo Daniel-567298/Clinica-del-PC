@@ -207,9 +207,11 @@ class AuthLoginView(APIView):
 
 
 class AuthLogoutView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     def post(self, request):
+        if not request.user.is_authenticated:
+            return Response({"authenticated": False})
         actor = _actor_label(request.user)
         ClinicEventBus.get_instance().publish(
             "LOGOUT",
